@@ -5,7 +5,7 @@ Github: https://github.com/JiangNanGenius
 description: 集成Kimi AI基础搜索、Bocha专业搜索、网页读取，支持LLM智能摘要提取、RAG向量化、语义重排序的智能搜索工具集，强化链接噪声治理和优雅回退，修复语法错误和分片重叠问题，实现并发LLM调用
 required_open_webui_version: 0.4.0
 requirements: openai>=1.0.0, requests, beautifulsoup4, numpy, aiohttp
-version: 3.9.2
+version: 3.9.3
 license: MIT
 """
 
@@ -233,6 +233,14 @@ class Tools:
             description="🌐 Jina API密钥 (用于网页读取)",
         )
 
+        # Kimi联网搜索配置
+        KIMI_FORCE_SEARCH: bool = Field(
+            default=True, description="🌙 强制Kimi进行联网搜索"
+        )
+        KIMI_SEARCH_MAX_RETRIES: int = Field(
+            default=3, description="🔄 Kimi联网搜索最大重试次数"
+        )
+
     def __init__(self):
         self.valves = self.Valves()
         self.kimi_client = None
@@ -242,29 +250,28 @@ class Tools:
         self.run_seq = 0
         self.citations_history = []
 
-    # ======================== Kimi AI 搜索 ========================
+    # ======================== Kimi AI 搜索（修复版：强制联网） ========================
     async def kimi_ai_search(
         self,
         search_query: str,
         context: str = "",
         __event_emitter__: Optional[Callable[[dict], Any]] = None,
     ) -> str:
-        """🌙 Kimi AI基础搜索"""
+        """🌙 Kimi AI基础搜索（修复版：强制联网）"""
 
         # === 内嵌工具函数 ===
-        def get_segmenter_client():
-            api_key = self.valves.SEGMENTER_API_KEY or self.valves.MOONSHOT_API_KEY
-            base_url = self.valves.SEGMENTER_BASE_URL or self.valves.MOONSHOT_BASE_URL
-            if not api_key:
-                raise ValueError("需要API密钥")
+        def get_kimi_client():
             if (
-                self.segmenter_client is None
-                or self.segmenter_client.api_key != api_key
-                or getattr(self.segmenter_client, "base_url_stored", None) != base_url
+                self.kimi_client is None
+                or self.kimi_client.api_key != self.valves.MOONSHOT_API_KEY
             ):
-                self.segmenter_client = OpenAI(base_url=base_url, api_key=api_key)
-                self.segmenter_client.base_url_stored = base_url
-            return self.segmenter_client
+                if not self.valves.MOONSHOT_API_KEY:
+                    raise ValueError("Moonshot API密钥是必需的")
+                self.kimi_client = OpenAI(
+                    base_url=self.valves.MOONSHOT_BASE_URL,
+                    api_key=self.valves.MOONSHOT_API_KEY,
+                )
+            return self.kimi_client
 
         def next_run_id(tool: str) -> str:
             self.run_seq += 1
@@ -298,16 +305,19 @@ class Tools:
         async def emit_citation_data(r: Dict, __event_emitter__, run_id: str, idx: int):
             if not (__event_emitter__ and self.valves.CITATION_LINKS):
                 return
+
             full_doc = r.get("content") or ""
             doc_for_emit = take_text(full_doc, self.valves.CITATION_DOC_MAX_CHARS)
             chunks = split_text_chunks(doc_for_emit, self.valves.CITATION_CHUNK_SIZE)
             base_title = (r.get("title") or "") or (r.get("url") or "Source")
             base_url = (r.get("url") or "").strip()
+
             for ci, chunk in enumerate(chunks, 1):
                 if self.valves.UNIQUE_REFERENCE_NAMES:
                     src_name = f"{base_title} | {base_url} | {run_id}#{idx}-{ci}-{uuid4().hex[:6]}"
                 else:
                     src_name = base_url or base_title
+
                 payload = {
                     "type": "citation",
                     "data": {
@@ -326,6 +336,7 @@ class Tools:
                     },
                 }
                 await __event_emitter__(payload)
+
                 if self.valves.PERSIST_CITATIONS:
                     self.citations_history.append(payload)
                     if len(self.citations_history) > self.valves.PERSIST_CITATIONS_MAX:
@@ -363,195 +374,380 @@ class Tools:
                     }
                 )
 
-        def parse_search_results(content: str):
-            debug_log(f"解析搜索结果内容: {content[:200]}...")
-            source_pattern = r"\[来源：(https?://[^\]]+)\]"
-            sources = re.findall(source_pattern, content)
-            reference_pattern = (
-                r"参考网站链接：\s*\n((?:\d+\.\s*\[https?://[^\]]+\]\([^\)]+\)\s*\n?)+)"
-            )
-            reference_match = re.search(reference_pattern, content, re.MULTILINE)
-            if reference_match:
-                reference_links = reference_match.group(1)
-                link_pattern = r"\[(https?://[^\]]+)\]\([^\)]+\)"
-                additional_sources = re.findall(link_pattern, reference_links)
-                sources.extend(additional_sources)
-            unique_sources = list(set(sources))
-            debug_log(f"找到 {len(unique_sources)} 个唯一来源")
-            sections = re.split(r"\n\d+\.\s*\*\*([^*]+)\*\*：", content)
+        def search_impl(arguments: Dict[str, Any]) -> Dict[str, Any]:
+            """
+            根据Kimi文档，使用内置$web_search时，只需要原封不动返回arguments即可
+            """
+            debug_log(f"Kimi $web_search 参数: {arguments}")
+            return arguments
+
+        async def chat_with_tool_calls(messages: list) -> tuple:
+            """
+            使用工具调用方式与Kimi交互，强制进行联网搜索
+            返回: (final_response, search_used, search_results)
+            """
+            client = get_kimi_client()
+
+            # 使用支持更大上下文的模型
+            model_to_use = "moonshot-v1-auto"
+            if "kimi" in self.valves.KIMI_MODEL.lower():
+                model_to_use = self.valves.KIMI_MODEL
+            elif "moonshot" in self.valves.KIMI_MODEL.lower():
+                model_to_use = self.valves.KIMI_MODEL
+            else:
+                # 默认使用auto模型
+                model_to_use = "moonshot-v1-auto"
+
+            debug_log(f"使用模型: {model_to_use}")
+
+            finish_reason = None
+            search_used = False
             search_results = []
-            for i in range(1, len(sections), 2):
-                if i + 1 < len(sections):
-                    title = sections[i].strip()
-                    content_part = sections[i + 1].strip()
-                    part_urls = re.findall(source_pattern, content_part)
-                    main_url = (
-                        part_urls[0]
-                        if part_urls
-                        else (unique_sources[0] if unique_sources else "")
+            final_content = ""
+
+            # 添加搜索工具声明
+            tools = [
+                {
+                    "type": "builtin_function",
+                    "function": {
+                        "name": "$web_search",
+                    },
+                }
+            ]
+
+            max_iterations = 5  # 防止无限循环
+            iteration = 0
+
+            while (
+                finish_reason is None or finish_reason == "tool_calls"
+            ) and iteration < max_iterations:
+                iteration += 1
+                debug_log(f"Kimi工具调用迭代 {iteration}")
+
+                try:
+                    completion = await asyncio.to_thread(
+                        client.chat.completions.create,
+                        model=model_to_use,
+                        messages=messages,
+                        temperature=self.valves.KIMI_TEMPERATURE,
+                        tools=tools,
+                        timeout=60,
                     )
-                    clean_content = re.sub(
-                        r"\[来源：[^\]]+\]", "", content_part
-                    ).strip()
-                    search_results.append(
+
+                    choice = completion.choices[0]
+                    finish_reason = choice.finish_reason
+
+                    debug_log(f"Kimi响应finish_reason: {finish_reason}")
+
+                    if finish_reason == "tool_calls":
+                        search_used = True
+                        await emit_status("🔍 Kimi正在进行联网搜索...")
+
+                        # 添加assistant消息到上下文
+                        messages.append(choice.message)
+
+                        # 处理工具调用
+                        for tool_call in choice.message.tool_calls:
+                            tool_call_name = tool_call.function.name
+                            tool_call_arguments = json.loads(
+                                tool_call.function.arguments
+                            )
+
+                            debug_log(f"工具调用: {tool_call_name}")
+                            debug_log(f"工具参数: {tool_call_arguments}")
+
+                            if tool_call_name == "$web_search":
+                                # 检查tokens消耗信息
+                                if "usage" in tool_call_arguments:
+                                    search_tokens = tool_call_arguments["usage"].get(
+                                        "total_tokens", 0
+                                    )
+                                    debug_log(f"搜索内容tokens消耗: {search_tokens}")
+
+                                tool_result = search_impl(tool_call_arguments)
+
+                                # 记录搜索结果用于后续解析
+                                search_results.append(
+                                    {
+                                        "arguments": tool_call_arguments,
+                                        "result": tool_result,
+                                    }
+                                )
+                            else:
+                                tool_result = f"Error: 无法找到工具 '{tool_call_name}'"
+
+                            # 添加工具结果到消息
+                            messages.append(
+                                {
+                                    "role": "tool",
+                                    "tool_call_id": tool_call.id,
+                                    "name": tool_call_name,
+                                    "content": json.dumps(
+                                        tool_result, ensure_ascii=False
+                                    ),
+                                }
+                            )
+
+                    elif finish_reason == "stop":
+                        final_content = choice.message.content or ""
+                        if completion.usage:
+                            debug_log(
+                                f"最终tokens消耗: prompt={completion.usage.prompt_tokens}, completion={completion.usage.completion_tokens}, total={completion.usage.total_tokens}"
+                            )
+                        break
+
+                except Exception as e:
+                    debug_log(f"Kimi工具调用异常: {e}")
+                    raise e
+
+            return final_content, search_used, search_results
+
+        def parse_kimi_response(content: str, search_results: List[Dict]) -> tuple:
+            """
+            解析Kimi的响应内容，提取结构化信息
+            返回: (parsed_results, sources)
+            """
+            debug_log(f"解析Kimi响应内容: {content[:300]}...")
+
+            # 从搜索结果中提取URL信息
+            urls_from_search = []
+            for sr in search_results:
+                args = sr.get("arguments", {})
+                if "urls" in args:
+                    urls_from_search.extend(args["urls"])
+                elif "url" in args:
+                    urls_from_search.append(args["url"])
+
+            # 从内容中提取链接
+            url_pattern = r'https?://[^\s\)\]\}，。；！？"\']*'
+            urls_from_content = re.findall(url_pattern, content)
+
+            # 合并所有URL
+            all_urls = list(set(urls_from_search + urls_from_content))
+            debug_log(f"提取到的URLs: {all_urls}")
+
+            # 尝试按段落分割内容
+            paragraphs = [p.strip() for p in content.split("\n\n") if p.strip()]
+
+            parsed_results = []
+
+            # 如果内容有明显的结构化信息
+            if any(
+                marker in content for marker in ["1.", "2.", "一、", "二、", "##", "**"]
+            ):
+                # 尝试解析结构化内容
+                sections = re.split(r"\n(?=\d+\.|\w+、|##|\*\*)", content)
+                for i, section in enumerate(sections):
+                    section = section.strip()
+                    if not section:
+                        continue
+
+                    # 提取标题（第一行）
+                    lines = section.split("\n")
+                    title = lines[0].strip("*#").strip()
+                    content_text = (
+                        "\n".join(lines[1:]).strip() if len(lines) > 1 else section
+                    )
+
+                    # 为每个段落分配URL
+                    section_url = ""
+                    if i < len(all_urls):
+                        section_url = all_urls[i]
+                    elif all_urls:
+                        section_url = all_urls[0]  # 使用第一个URL作为默认
+
+                    parsed_results.append(
                         {
-                            "content": clean_content,
-                            "title": title,
-                            "url": main_url,
+                            "title": title or f"搜索结果 {i+1}",
+                            "content": content_text or section,
+                            "url": section_url,
                             "site_name": (
-                                main_url.split("/")[2] if main_url else "Unknown"
+                                section_url.split("/")[2]
+                                if section_url and "/" in section_url
+                                else "Kimi搜索"
                             ),
                             "date_published": datetime.now().strftime("%Y-%m-%d"),
-                            "source_type": "Kimi AI基础搜索",
+                            "source_type": "Kimi AI联网搜索",
                         }
                     )
-            if not search_results and unique_sources:
-                search_results.append(
+            else:
+                # 没有明显结构，将整个内容作为一个结果
+                main_url = all_urls[0] if all_urls else ""
+                parsed_results.append(
                     {
-                        "content": re.sub(r"\[来源：[^\]]+\]", "", content).strip(),
-                        "title": search_query,
-                        "url": unique_sources[0],
+                        "title": f"关于 {search_query}",
+                        "content": content,
+                        "url": main_url,
                         "site_name": (
-                            unique_sources[0].split("/")[2]
-                            if unique_sources
-                            else "Unknown"
+                            main_url.split("/")[2]
+                            if main_url and "/" in main_url
+                            else "Kimi搜索"
                         ),
                         "date_published": datetime.now().strftime("%Y-%m-%d"),
-                        "source_type": "Kimi AI基础搜索",
+                        "source_type": "Kimi AI联网搜索",
                     }
                 )
-            debug_log(f"解析完成，得到 {len(search_results)} 个结果")
-            return search_results, unique_sources
 
-        def get_kimi_client():
-            if (
-                self.kimi_client is None
-                or self.kimi_client.api_key != self.valves.MOONSHOT_API_KEY
-            ):
-                if not self.valves.MOONSHOT_API_KEY:
-                    raise ValueError("Moonshot API密钥是必需的")
-                self.kimi_client = OpenAI(
-                    base_url=self.valves.MOONSHOT_BASE_URL,
-                    api_key=self.valves.MOONSHOT_API_KEY,
-                )
-            return self.kimi_client
-
-        def chat_with_kimi(messages: list):
-            client = get_kimi_client()
-            completion = client.chat.completions.create(
-                model=self.valves.KIMI_MODEL,
-                messages=messages,
-                temperature=self.valves.KIMI_TEMPERATURE,
-            )
-            return completion.choices[0]
+            debug_log(f"解析完成，得到 {len(parsed_results)} 个结果")
+            return parsed_results, all_urls
 
         try:
             debug_log(f"开始Kimi AI搜索: {search_query}, 上下文: {context}")
+
+            # 构建搜索提示
             if context:
-                enhanced_query = f"在'{context}'的背景下，搜索关于'{search_query}'的信息。请提供详细且有引用来源的回答。"
+                search_prompt = f"请搜索关于'{search_query}'的最新信息，特别是在'{context}'背景下的相关内容。请确保进行实时搜索以获取准确和最新的信息。"
                 await emit_status(
-                    f"🌙 开始Kimi AI搜索: {search_query} (背景: {context})"
+                    f"🌙 开始Kimi AI联网搜索: {search_query} (背景: {context})"
                 )
             else:
-                enhanced_query = (
-                    f"搜索关于'{search_query}'的信息。请提供详细且有引用来源的回答。"
-                )
-                await emit_status(f"🌙 开始Kimi AI搜索: {search_query}")
+                search_prompt = f"请搜索关于'{search_query}'的最新信息。请确保进行实时联网搜索以获取准确和最新的信息，并提供详细的搜索结果。"
+                await emit_status(f"🌙 开始Kimi AI联网搜索: {search_query}")
 
-            system_prompt = """你是Kimi AI，一个基础的搜索助手。
-请按照以下格式要求回答：
-**回答结构：**
-1. **标题1**：内容描述。[来源：完整URL]
-2. **标题2**：内容描述。[来源：完整URL]  
-3. **标题3**：内容描述。[来源：完整URL]
+            # 强调联网搜索的系统提示
+            system_prompt = """你是Kimi AI助手，具有强大的实时联网搜索能力。
 
-**引用格式：**
-- 在每个信息点后使用：[来源：完整URL]
-- 在回答末尾列出所有参考网站链接
+重要指示：
+1. 必须使用$web_search工具进行实时联网搜索
+2. 不要仅依赖训练数据，必须获取最新信息
+3. 搜索结果要包含具体的网站链接和来源
+4. 按结构化方式组织搜索结果，包含标题、内容和来源链接
 
-请基于搜索结果提供相关信息。"""
+请严格遵循以上要求，确保进行真实的联网搜索。"""
 
             messages = [
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": enhanced_query},
+                {"role": "user", "content": search_prompt},
             ]
 
-            retry_count = 0
-            while retry_count < self.valves.MAX_RETRIES:
+            # 重试机制确保联网搜索
+            search_success = False
+            final_content = ""
+            all_search_results = []
+
+            for attempt in range(self.valves.KIMI_SEARCH_MAX_RETRIES):
                 try:
-                    debug_log(f"发送Kimi请求，重试次数: {retry_count}")
-                    choice = chat_with_kimi(messages)
-                    await emit_status("✅ 搜索完成，正在处理结果...")
-                    content = choice.message.content
-                    debug_log(f"Kimi最终回答: {content[:500]}...")
-                    search_results, sources = parse_search_results(content)
-
-                    for idx, r in enumerate(search_results):
-                        await emit_citation_data(r, __event_emitter__, run_id, idx)
-
-                    results_data = []
-                    for r in search_results:
-                        result_item = {
-                            "title": r.get("title", ""),
-                            "url": r.get("url", ""),
-                            "snippet": take_text(r.get("content", ""), 300),
-                        }
-                        if self.valves.RETURN_CONTENT_IN_RESULTS:
-                            result_item["content"] = take_text(
-                                r.get("content", ""),
-                                self.valves.RETURN_CONTENT_MAX_CHARS,
-                            )
-                        results_data.append(result_item)
-
-                    result = {
-                        "summary": {
-                            "total_results": len(search_results),
-                            "total_sources": len(sources),
-                            "search_query": search_query,
-                            "context": context,
-                            "search_type": "🌙 Kimi AI基础搜索",
-                            "timestamp": datetime.now().isoformat(),
-                        },
-                        "results": results_data,
-                    }
-
-                    await emit_status(
-                        "🎉 Kimi AI搜索完成！", status="complete", done=True
+                    debug_log(
+                        f"Kimi搜索尝试 {attempt + 1}/{self.valves.KIMI_SEARCH_MAX_RETRIES}"
                     )
-                    return json.dumps(result, ensure_ascii=False, indent=2)
+
+                    content, search_used, search_results = await chat_with_tool_calls(
+                        messages.copy()
+                    )
+
+                    if search_used:
+                        debug_log("✅ 确认Kimi进行了联网搜索")
+                        search_success = True
+                        final_content = content
+                        all_search_results = search_results
+                        break
+                    else:
+                        debug_log(
+                            f"⚠️ 第{attempt + 1}次尝试：Kimi未进行联网搜索，准备重试"
+                        )
+                        if attempt < self.valves.KIMI_SEARCH_MAX_RETRIES - 1:
+                            # 修改提示词，更强调联网搜索
+                            messages = [
+                                {
+                                    "role": "system",
+                                    "content": system_prompt
+                                    + "\n\n特别强调：你必须使用$web_search工具进行联网搜索，不得仅使用已有知识回答。",
+                                },
+                                {
+                                    "role": "user",
+                                    "content": f"请立即使用联网搜索功能查找关于'{search_query}'的最新信息。这是第{attempt + 2}次请求，请务必进行实时搜索。",
+                                },
+                            ]
+                            await asyncio.sleep(1)  # 短暂延迟
 
                 except Exception as e:
-                    retry_count += 1
-                    debug_log(
-                        f"Kimi请求失败，重试 {retry_count}/{self.valves.MAX_RETRIES}", e
-                    )
-                    if retry_count < self.valves.MAX_RETRIES:
-                        await emit_status(
-                            f"⚠️ 重试 {retry_count}/{self.valves.MAX_RETRIES}: {str(e)}"
-                        )
-                        await asyncio.sleep(1)
-                    else:
+                    debug_log(f"Kimi搜索尝试 {attempt + 1} 失败: {e}")
+                    if attempt == self.valves.KIMI_SEARCH_MAX_RETRIES - 1:
                         raise e
+                    await asyncio.sleep(2)
 
-            raise Exception("搜索过程异常结束")
+            if not search_success:
+                # 如果所有重试都未进行联网搜索，返回警告
+                debug_log("❌ 所有重试都未能触发Kimi联网搜索")
+                await emit_status(
+                    "⚠️ 未能触发联网搜索，返回基础回答", status="warning", done=True
+                )
+
+                error_result = {
+                    "summary": {
+                        "total_results": 0,
+                        "total_sources": 0,
+                        "search_query": search_query,
+                        "context": context,
+                        "search_type": "🌙 Kimi AI基础搜索",
+                        "timestamp": datetime.now().isoformat(),
+                        "status": "warning",
+                        "message": "未能触发联网搜索功能",
+                    },
+                    "results": [],
+                }
+                return json.dumps(error_result, ensure_ascii=False, indent=2)
+
+            await emit_status("✅ 联网搜索完成，正在处理结果...")
+
+            # 解析搜索结果
+            parsed_results, sources = parse_kimi_response(
+                final_content, all_search_results
+            )
+
+            # 发送引用数据
+            for idx, r in enumerate(parsed_results):
+                await emit_citation_data(r, __event_emitter__, run_id, idx)
+
+            # 构建返回数据
+            results_data = []
+            for r in parsed_results:
+                result_item = {
+                    "title": r.get("title", ""),
+                    "url": r.get("url", ""),
+                    "snippet": take_text(r.get("content", ""), 300),
+                }
+                if self.valves.RETURN_CONTENT_IN_RESULTS:
+                    result_item["content"] = take_text(
+                        r.get("content", ""),
+                        self.valves.RETURN_CONTENT_MAX_CHARS,
+                    )
+                results_data.append(result_item)
+
+            result = {
+                "summary": {
+                    "total_results": len(parsed_results),
+                    "total_sources": len(sources),
+                    "search_query": search_query,
+                    "context": context,
+                    "search_type": "🌙 Kimi AI联网搜索",
+                    "timestamp": datetime.now().isoformat(),
+                    "search_verified": search_success,
+                },
+                "results": results_data,
+            }
+
+            await emit_status("🎉 Kimi AI联网搜索完成！", status="complete", done=True)
+            return json.dumps(result, ensure_ascii=False, indent=2)
 
         except Exception as e:
             debug_log("Kimi AI搜索失败", e)
             await emit_status(
                 f"❌ Kimi AI搜索失败: {str(e)}", status="error", done=True
             )
+
             error_result = {
-                "search_results": [],
-                "error": str(e),
                 "summary": {
                     "total_results": 0,
                     "total_sources": 0,
                     "search_query": search_query,
                     "context": context,
-                    "search_type": "🌙 Kimi AI基础搜索",
+                    "search_type": "🌙 Kimi AI联网搜索",
                     "timestamp": datetime.now().isoformat(),
                     "status": "error",
+                    "error": str(e),
                 },
+                "results": [],
             }
             return json.dumps(error_result, ensure_ascii=False, indent=2)
 
@@ -595,16 +791,19 @@ class Tools:
         async def emit_citation_data(r: Dict, __event_emitter__, run_id: str, idx: int):
             if not (__event_emitter__ and self.valves.CITATION_LINKS):
                 return
+
             full_doc = r.get("content") or ""
             doc_for_emit = take_text(full_doc, self.valves.CITATION_DOC_MAX_CHARS)
             chunks = split_text_chunks(doc_for_emit, self.valves.CITATION_CHUNK_SIZE)
             base_title = (r.get("title") or "") or (r.get("url") or "Source")
             base_url = (r.get("url") or "").strip()
+
             for ci, chunk in enumerate(chunks, 1):
                 if self.valves.UNIQUE_REFERENCE_NAMES:
                     src_name = f"{base_title} | {base_url} | {run_id}#{idx}-{ci}-{uuid4().hex[:6]}"
                 else:
                     src_name = base_url or base_title
+
                 payload = {
                     "type": "citation",
                     "data": {
@@ -623,6 +822,7 @@ class Tools:
                     },
                 }
                 await __event_emitter__(payload)
+
                 if self.valves.PERSIST_CITATIONS:
                     self.citations_history.append(payload)
                     if len(self.citations_history) > self.valves.PERSIST_CITATIONS_MAX:
@@ -633,22 +833,27 @@ class Tools:
         async def get_text_embedding(text: str) -> Optional[List[float]]:
             if not self.valves.ENABLE_RAG_ENHANCEMENT or not self.valves.ARK_API_KEY:
                 return None
+
             text_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
             if text_hash in self.embedding_cache:
                 return self.embedding_cache[text_hash]
+
             try:
                 headers = {
                     "Authorization": f"Bearer {self.valves.ARK_API_KEY}",
                     "Content-Type": "application/json",
                 }
+
                 clean_text = text.strip()[:4000]
                 if not clean_text:
                     return None
+
                 payload = {
                     "model": self.valves.EMBEDDING_MODEL,
                     "input": [clean_text],
                     "encoding_format": "float",
                 }
+
                 response = requests.post(
                     f"{self.valves.EMBEDDING_BASE_URL}/embeddings",
                     headers=headers,
@@ -657,12 +862,14 @@ class Tools:
                 )
                 response.raise_for_status()
                 data = response.json()
+
                 if "data" in data and len(data["data"]) > 0:
                     embedding = data["data"][0]["embedding"]
                     self.embedding_cache[text_hash] = embedding
                     return embedding
                 else:
                     return None
+
             except Exception:
                 return None
 
@@ -724,16 +931,19 @@ class Tools:
                 return []
             if not (self.valves.ENABLE_RAG_ENHANCEMENT and self.valves.ARK_API_KEY):
                 return [None for _ in texts]
+
             headers = {
                 "Authorization": f"Bearer {self.valves.ARK_API_KEY}",
                 "Content-Type": "application/json",
             }
+
             try:
                 payload = {
                     "model": self.valves.EMBEDDING_MODEL,
                     "input": [t[:4000] for t in texts],
                     "encoding_format": "float",
                 }
+
                 resp = await asyncio.to_thread(
                     requests.post,
                     f"{self.valves.EMBEDDING_BASE_URL}/embeddings",
@@ -743,6 +953,7 @@ class Tools:
                 )
                 resp.raise_for_status()
                 data = resp.json()
+
                 vecs = [d["embedding"] for d in data.get("data", [])]
                 if len(vecs) != len(texts):
                     fallback = []
@@ -750,7 +961,9 @@ class Tools:
                         v = await get_text_embedding(t)
                         fallback.append(v)
                     return fallback
+
                 return vecs
+
             except Exception:
                 out = []
                 for t in texts:
@@ -762,6 +975,7 @@ class Tools:
             if not self.valves.ENABLE_RAG_ENHANCEMENT or not results:
                 debug_log("RAG未启用或结果为空")
                 return results
+
             try:
                 await emit_status(f"🧠 正在进行RAG向量化优化 ({len(results)} 个结果)")
                 debug_log(f"开始RAG优化，查询: {query}, 结果数: {len(results)}")
@@ -770,6 +984,7 @@ class Tools:
                 aspects = plan_aspects(query)
                 all_texts = [query] + aspects
                 all_vecs = await batch_embeddings(all_texts)
+
                 query_vec = all_vecs[0] if all_vecs else None
                 aspect_vecs = all_vecs[1:] if len(all_vecs) > 1 else []
 
@@ -793,6 +1008,7 @@ class Tools:
                     if not content:
                         debug_log(f"结果 {i} 内容为空，跳过")
                         continue
+
                     content_embedding = await get_text_embedding(content)
                     if content_embedding:
                         similarity = fuse_similarity(content_embedding)
@@ -809,9 +1025,11 @@ class Tools:
                 enhanced_results.sort(
                     key=lambda x: x.get("rag_similarity", 0), reverse=True
                 )
+
                 debug_log(f"RAG优化完成，保留 {len(enhanced_results)} 个结果")
                 await emit_status(f"✅ RAG优化完成")
                 return enhanced_results
+
             except Exception as e:
                 debug_log("RAG优化失败", e)
                 return results
@@ -824,6 +1042,7 @@ class Tools:
             ):
                 debug_log("语义重排序未启用或配置不完整")
                 return results
+
             try:
                 await emit_status(f"🎯 正在进行语义重排序 ({len(results)} 个结果)")
                 debug_log(f"开始语义重排序，查询: {query}")
@@ -831,6 +1050,7 @@ class Tools:
                 # 构造 documents 时建立映射
                 documents = []
                 doc_to_result_idx = []
+
                 for i, result in enumerate(results):
                     content = (result.get("content") or "")[:4000]
                     if content:
@@ -845,6 +1065,7 @@ class Tools:
                     "Authorization": f"Bearer {self.valves.BOCHA_API_KEY}",
                     "Content-Type": "application/json",
                 }
+
                 payload = {
                     "model": self.valves.RERANK_MODEL,
                     "query": query,
@@ -852,6 +1073,7 @@ class Tools:
                     "top_n": min(self.valves.RERANK_TOP_N, len(documents)),
                     "return_documents": False,
                 }
+
                 response = requests.post(
                     self.valves.RERANK_ENDPOINT,
                     headers=headers,
@@ -860,25 +1082,30 @@ class Tools:
                 )
                 response.raise_for_status()
                 data = response.json()
+
                 if "data" in data and "results" in data["data"]:
                     rerank_results_data = data["data"]["results"]
                     reranked_results = []
+
                     # 回填时使用映射
                     for rerank_item in rerank_results_data:
                         doc_idx = rerank_item.get("index", 0)
                         relevance_score = rerank_item.get("relevance_score", 0.0)
+
                         if 0 <= doc_idx < len(doc_to_result_idx):
                             orig_idx = doc_to_result_idx[doc_idx]
                             result = results[orig_idx].copy()
                             result["rerank_score"] = relevance_score
                             result["rerank_enhanced"] = True
                             reranked_results.append(result)
+
                     debug_log(f"重排序完成，返回 {len(reranked_results)} 个结果")
                     await emit_status(f"✅ 语义重排序完成")
                     return reranked_results
                 else:
                     debug_log("重排序响应格式异常")
                     return results
+
             except Exception as e:
                 debug_log("语义重排序失败", e)
                 return results
@@ -891,6 +1118,7 @@ class Tools:
                 "Authorization": f"Bearer {self.valves.BOCHA_API_KEY}",
                 "Content-Type": "application/json",
             }
+
             payload = {
                 "query": query,
                 "freshness": self.valves.FRESHNESS,
@@ -899,6 +1127,7 @@ class Tools:
             }
 
             await emit_status("⏳ 正在连接专业中文搜索服务器...")
+
             resp = requests.post(
                 self.valves.CHINESE_WEB_SEARCH_ENDPOINT,
                 headers=headers,
@@ -910,11 +1139,13 @@ class Tools:
 
             source_context_list = []
             len_raw = 0
+
             if "data" in data and "webPages" in data["data"]:
                 web_pages = data["data"]["webPages"]
                 if "value" in web_pages and isinstance(web_pages["value"], list):
                     len_raw = len(web_pages["value"])
                     await emit_status(f"📄 正在处理 {len_raw} 个中文网页结果...")
+
                     for i, item in enumerate(web_pages["value"]):
                         url = item.get("url", "")
                         snippet = item.get("snippet", "")
@@ -922,10 +1153,12 @@ class Tools:
                         name = item.get("name", "")
                         site_name = item.get("siteName", "")
                         date_published = item.get("datePublished", "")
+
                         content = summary or snippet
                         if not content:
                             debug_log(f"中文搜索结果 {i} 内容为空，跳过")
                             continue
+
                         result_item = {
                             "content": content,
                             "title": name,
@@ -958,6 +1191,7 @@ class Tools:
             if source_context_list:
                 rags = [float(x.get("rag_similarity", 0)) for x in source_context_list]
                 rers = [float(x.get("rerank_score", 0)) for x in source_context_list]
+
                 rags_n, rers_n = map(zminmax, (rags, rers))
 
                 for i, s in enumerate(source_context_list):
@@ -1079,16 +1313,19 @@ class Tools:
         async def emit_citation_data(r: Dict, __event_emitter__, run_id: str, idx: int):
             if not (__event_emitter__ and self.valves.CITATION_LINKS):
                 return
+
             full_doc = r.get("content") or ""
             doc_for_emit = take_text(full_doc, self.valves.CITATION_DOC_MAX_CHARS)
             chunks = split_text_chunks(doc_for_emit, self.valves.CITATION_CHUNK_SIZE)
             base_title = (r.get("title") or "") or (r.get("url") or "Source")
             base_url = (r.get("url") or "").strip()
+
             for ci, chunk in enumerate(chunks, 1):
                 if self.valves.UNIQUE_REFERENCE_NAMES:
                     src_name = f"{base_title} | {base_url} | {run_id}#{idx}-{ci}-{uuid4().hex[:6]}"
                 else:
                     src_name = base_url or base_title
+
                 payload = {
                     "type": "citation",
                     "data": {
@@ -1107,6 +1344,7 @@ class Tools:
                     },
                 }
                 await __event_emitter__(payload)
+
                 if self.valves.PERSIST_CITATIONS:
                     self.citations_history.append(payload)
                     if len(self.citations_history) > self.valves.PERSIST_CITATIONS_MAX:
@@ -1117,22 +1355,27 @@ class Tools:
         async def get_text_embedding(text: str) -> Optional[List[float]]:
             if not self.valves.ENABLE_RAG_ENHANCEMENT or not self.valves.ARK_API_KEY:
                 return None
+
             text_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
             if text_hash in self.embedding_cache:
                 return self.embedding_cache[text_hash]
+
             try:
                 headers = {
                     "Authorization": f"Bearer {self.valves.ARK_API_KEY}",
                     "Content-Type": "application/json",
                 }
+
                 clean_text = text.strip()[:4000]
                 if not clean_text:
                     return None
+
                 payload = {
                     "model": self.valves.EMBEDDING_MODEL,
                     "input": [clean_text],
                     "encoding_format": "float",
                 }
+
                 response = requests.post(
                     f"{self.valves.EMBEDDING_BASE_URL}/embeddings",
                     headers=headers,
@@ -1141,12 +1384,14 @@ class Tools:
                 )
                 response.raise_for_status()
                 data = response.json()
+
                 if "data" in data and len(data["data"]) > 0:
                     embedding = data["data"][0]["embedding"]
                     self.embedding_cache[text_hash] = embedding
                     return embedding
                 else:
                     return None
+
             except Exception:
                 return None
 
@@ -1215,16 +1460,19 @@ class Tools:
                 return []
             if not (self.valves.ENABLE_RAG_ENHANCEMENT and self.valves.ARK_API_KEY):
                 return [None for _ in texts]
+
             headers = {
                 "Authorization": f"Bearer {self.valves.ARK_API_KEY}",
                 "Content-Type": "application/json",
             }
+
             try:
                 payload = {
                     "model": self.valves.EMBEDDING_MODEL,
                     "input": [t[:4000] for t in texts],
                     "encoding_format": "float",
                 }
+
                 resp = await asyncio.to_thread(
                     requests.post,
                     f"{self.valves.EMBEDDING_BASE_URL}/embeddings",
@@ -1234,6 +1482,7 @@ class Tools:
                 )
                 resp.raise_for_status()
                 data = resp.json()
+
                 vecs = [d["embedding"] for d in data.get("data", [])]
                 if len(vecs) != len(texts):
                     fallback = []
@@ -1241,7 +1490,9 @@ class Tools:
                         v = await get_text_embedding(t)
                         fallback.append(v)
                     return fallback
+
                 return vecs
+
             except Exception:
                 out = []
                 for t in texts:
@@ -1252,6 +1503,7 @@ class Tools:
         async def enhance_results_with_rag(results: List[Dict]) -> List[Dict]:
             if not self.valves.ENABLE_RAG_ENHANCEMENT or not results:
                 return results
+
             try:
                 await emit_status(f"🧠 RAG优化 ({len(results)} 个结果)")
 
@@ -1259,6 +1511,7 @@ class Tools:
                 aspects = plan_aspects(query)
                 all_texts = [query] + aspects
                 all_vecs = await batch_embeddings(all_texts)
+
                 query_vec = all_vecs[0] if all_vecs else None
                 aspect_vecs = all_vecs[1:] if len(all_vecs) > 1 else []
 
@@ -1280,6 +1533,7 @@ class Tools:
                     content = result.get("content", "")
                     if not content:
                         continue
+
                     content_embedding = await get_text_embedding(content)
                     if content_embedding:
                         similarity = fuse_similarity(content_embedding)
@@ -1294,8 +1548,10 @@ class Tools:
                 enhanced_results.sort(
                     key=lambda x: x.get("rag_similarity", 0), reverse=True
                 )
+
                 await emit_status(f"✅ RAG优化完成")
                 return enhanced_results
+
             except Exception as e:
                 debug_log("RAG优化失败", e)
                 return results
@@ -1307,12 +1563,14 @@ class Tools:
                 or not self.valves.BOCHA_API_KEY
             ):
                 return results
+
             try:
                 await emit_status(f"🎯 语义重排序 ({len(results)} 个结果)")
 
                 # 构造 documents 时建立映射
                 documents = []
                 doc_to_result_idx = []
+
                 for i, result in enumerate(results):
                     content = (result.get("content") or "")[:4000]
                     if content:
@@ -1326,6 +1584,7 @@ class Tools:
                     "Authorization": f"Bearer {self.valves.BOCHA_API_KEY}",
                     "Content-Type": "application/json",
                 }
+
                 payload = {
                     "model": self.valves.RERANK_MODEL,
                     "query": query,
@@ -1333,6 +1592,7 @@ class Tools:
                     "top_n": min(self.valves.RERANK_TOP_N, len(documents)),
                     "return_documents": False,
                 }
+
                 response = requests.post(
                     self.valves.RERANK_ENDPOINT,
                     headers=headers,
@@ -1341,23 +1601,28 @@ class Tools:
                 )
                 response.raise_for_status()
                 data = response.json()
+
                 if "data" in data and "results" in data["data"]:
                     rerank_results_data = data["data"]["results"]
                     reranked_results = []
+
                     # 回填时使用映射
                     for rerank_item in rerank_results_data:
                         doc_idx = rerank_item.get("index", 0)
                         relevance_score = rerank_item.get("relevance_score", 0.0)
+
                         if 0 <= doc_idx < len(doc_to_result_idx):
                             orig_idx = doc_to_result_idx[doc_idx]
                             result = results[orig_idx].copy()
                             result["rerank_score"] = relevance_score
                             result["rerank_enhanced"] = True
                             reranked_results.append(result)
+
                     await emit_status(f"✅ 语义重排序完成")
                     return reranked_results
                 else:
                     return results
+
             except Exception as e:
                 debug_log("语义重排序失败", e)
                 return results
@@ -1369,6 +1634,7 @@ class Tools:
                 "Authorization": f"Bearer {self.valves.LANGSEARCH_API_KEY}",
                 "Content-Type": "application/json",
             }
+
             payload = {
                 "query": query,
                 "freshness": self.valves.FRESHNESS,
@@ -1377,6 +1643,7 @@ class Tools:
             }
 
             await emit_status("⏳ 连接英文搜索服务器...")
+
             resp = requests.post(
                 self.valves.ENGLISH_WEB_SEARCH_ENDPOINT,
                 headers=headers,
@@ -1388,15 +1655,18 @@ class Tools:
 
             source_context_list = []
             len_raw = 0
+
             if "data" in data and "webPages" in data["data"]:
                 web_pages = data["data"]["webPages"]
                 if "value" in web_pages and isinstance(web_pages["value"], list):
                     len_raw = len(web_pages["value"])
                     await emit_status(f"📄 处理 {len_raw} 个英文结果...")
+
                     for i, item in enumerate(web_pages["value"]):
                         content = item.get("summary", "") or item.get("snippet", "")
                         if not content:
                             continue
+
                         result_item = {
                             "content": content,
                             "title": item.get("name", ""),
@@ -1427,6 +1697,7 @@ class Tools:
             if source_context_list:
                 rags = [float(x.get("rag_similarity", 0)) for x in source_context_list]
                 rers = [float(x.get("rerank_score", 0)) for x in source_context_list]
+
                 rags_n, rers_n = map(zminmax, (rags, rers))
 
                 for i, s in enumerate(source_context_list):
@@ -1535,6 +1806,7 @@ class Tools:
                     ):
                         tbl.append(lines[i])
                         i += 1
+
                     # 解析表头和行
                     if len(tbl) >= 3:  # 至少要有表头、分割线、数据行
                         header = [h.strip() for h in tbl[0].strip("| ").split("|")]
@@ -1609,6 +1881,7 @@ class Tools:
                     return key
 
                 text = re.sub(r"https?://[^\s\)\]]+", _url_sub, text)
+
             return text, holders
 
         def _restore_placeholders(text: str, holders: dict) -> str:
@@ -1631,6 +1904,7 @@ class Tools:
             text = re.sub(r"([。！？；…])", r"\1⟦SPLIT⟧", text)
             text = re.sub(r"([.!?;])(\s+)(?=[A-Z0-9\"'])", r"\1⟦SPLIT⟧", text)
             text = text.replace("⟦PARA⟧", "⟦SPLIT⟧")
+
             parts = [p.strip() for p in text.split("⟦SPLIT⟧") if p.strip()]
 
             if self.valves.DENOISE_LINK_SECTIONS:
@@ -1648,6 +1922,7 @@ class Tools:
                         continue
                     cleaned.append(s)
                 parts = cleaned
+
             return parts
 
         def _pack_sentences_to_chunks(sentences: List[str]) -> List[dict]:
@@ -1655,33 +1930,41 @@ class Tools:
             tgt = max(800, int(self.valves.TARGET_CHUNK_CHARS))
             hard = max(tgt, int(self.valves.MAX_CHUNK_CHARS))
             ovl = max(0, int(self.valves.OVERLAP_SENTENCES))
+
             chunks = []
             i = 0
+
             while i < len(sentences) and len(chunks) < int(
                 self.valves.MAX_TOTAL_CHUNKS
             ):
                 buf, size, start = [], 0, i
+
                 while i < len(sentences):
                     s = sentences[i]
                     s_len = len(s) + 1
+
                     if size + s_len > tgt:
                         if not buf:
                             s_cut = s[:hard]
                             buf.append(s_cut)
                             sentences[i] = s[hard:]
                         break
+
                     buf.append(s)
                     size += s_len
                     i += 1
+
                 if buf:
                     text = " ".join(buf).strip()
                     end = start + len(buf) - 1
                     chunks.append({"text": text, "start_sent": start, "end_sent": end})
+
                     # 修复分片重叠逻辑：正确的回退
                     if i < len(sentences):  # 只有在还有剩余句子时才回退
                         i = max(end - ovl + 1, start + 1)  # 确保至少前进一个句子
                 else:
                     i += 1
+
             return chunks
 
         def smart_segment_text(raw_text: str) -> List[dict]:
@@ -1689,16 +1972,20 @@ class Tools:
             protected, holders = _protect_blocks_and_links(raw_text)
             sentences = _split_sentences_zh_en(protected)
             chunks = _pack_sentences_to_chunks(sentences)
+
             for c in chunks:
                 c["text"] = _restore_placeholders(c["text"], holders)
+
             return chunks
 
         # === 其他工具函数 ===
         def get_segmenter_client():
             api_key = self.valves.SEGMENTER_API_KEY or self.valves.MOONSHOT_API_KEY
             base_url = self.valves.SEGMENTER_BASE_URL or self.valves.MOONSHOT_BASE_URL
+
             if not api_key:
                 raise ValueError("LLM需要API密钥")
+
             if (
                 self.segmenter_client is None
                 or self.segmenter_client.api_key != api_key
@@ -1706,6 +1993,7 @@ class Tools:
             ):
                 self.segmenter_client = OpenAI(base_url=base_url, api_key=api_key)
                 self.segmenter_client.base_url_stored = base_url
+
             return self.segmenter_client
 
         # LLM调用硬超时
@@ -1719,6 +2007,7 @@ class Tools:
                 if temperature is not None
                 else self.valves.SUMMARY_TEMPERATURE
             )
+
             last_err = None
             for attempt in range(self.valves.LLM_RETRIES + 1):
                 try:
@@ -1734,12 +2023,14 @@ class Tools:
                         timeout=self.valves.LLM_REQUEST_TIMEOUT_SEC,
                     )
                     return resp.choices[0].message.content
+
                 except Exception as e:
                     last_err = e
                     if attempt < self.valves.LLM_RETRIES:
                         await asyncio.sleep(
                             self.valves.LLM_BACKOFF_BASE_SEC * (attempt + 1)
                         )
+
             raise Exception(f"LLM调用失败: {last_err}")
 
         def is_wikipedia(u: str) -> bool:
@@ -1780,16 +2071,19 @@ class Tools:
         async def emit_citation_data(r: Dict, __event_emitter__, run_id: str, idx: int):
             if not (__event_emitter__ and self.valves.CITATION_LINKS):
                 return
+
             full_doc = r.get("content") or ""
             doc_for_emit = take_text(full_doc, self.valves.CITATION_DOC_MAX_CHARS)
             chunks = split_text_chunks(doc_for_emit, self.valves.CITATION_CHUNK_SIZE)
             base_title = (r.get("title") or "") or (r.get("url") or "Source")
             base_url = (r.get("url") or "").strip()
+
             for ci, chunk in enumerate(chunks, 1):
                 if self.valves.UNIQUE_REFERENCE_NAMES:
                     src_name = f"{base_title} | {base_url} | {run_id}#{idx}-{ci}-{uuid4().hex[:6]}"
                 else:
                     src_name = base_url or base_title
+
                 payload = {
                     "type": "citation",
                     "data": {
@@ -1808,6 +2102,7 @@ class Tools:
                     },
                 }
                 await __event_emitter__(payload)
+
                 if self.valves.PERSIST_CITATIONS:
                     self.citations_history.append(payload)
                     if len(self.citations_history) > self.valves.PERSIST_CITATIONS_MAX:
@@ -1872,6 +2167,7 @@ class Tools:
                 chunks = chunks[: int(self.valves.MAX_TOTAL_CHUNKS)]
 
             debug_log(f"分片完成：{len(chunks)} 片")
+
             await progress_mgr.update_step(
                 f"📄 开始处理 {len(chunks)} 个分片", __event_emitter__
             )
@@ -1970,7 +2266,7 @@ class Tools:
                 user_prompt = f"""用户需求：{user_request}
 
 分片内容：
-{c['text'][:4000]}  
+{c['text'][:4000]}
 
 请严格按JSON数组格式输出："""
 
@@ -2032,7 +2328,6 @@ class Tools:
 
                         # 兜底填充
                         kp = derive_key_points(s)
-
                         out.append(
                             {
                                 "content": s,
@@ -2148,6 +2443,7 @@ class Tools:
             await progress_mgr.update_step(
                 f"✅ 摘要提取完成，获得 {len(all_summaries)} 条摘要", __event_emitter__
             )
+
             debug_log(f"最终摘要提取完成：共 {len(all_summaries)} 条")
             return all_summaries
 
@@ -2157,16 +2453,19 @@ class Tools:
                 return []
             if not (self.valves.ENABLE_RAG_ENHANCEMENT and self.valves.ARK_API_KEY):
                 return [None for _ in texts]
+
             headers = {
                 "Authorization": f"Bearer {self.valves.ARK_API_KEY}",
                 "Content-Type": "application/json",
             }
+
             try:
                 payload = {
                     "model": self.valves.EMBEDDING_MODEL,
                     "input": [t[:4000] for t in texts],
                     "encoding_format": "float",
                 }
+
                 resp = await asyncio.to_thread(
                     requests.post,
                     f"{self.valves.EMBEDDING_BASE_URL}/embeddings",
@@ -2176,6 +2475,7 @@ class Tools:
                 )
                 resp.raise_for_status()
                 data = resp.json()
+
                 vecs = [d["embedding"] for d in data.get("data", [])]
                 if len(vecs) != len(texts):
                     debug_log("批量向量化长度不匹配，回退单个处理")
@@ -2184,7 +2484,9 @@ class Tools:
                         v = await get_single_embedding(t)
                         fallback.append(v)
                     return fallback
+
                 return vecs
+
             except Exception as e:
                 debug_log(f"批量向量化失败：{e}")
                 out = []
@@ -2196,22 +2498,27 @@ class Tools:
         async def get_single_embedding(text: str) -> Optional[List[float]]:
             if not self.valves.ENABLE_RAG_ENHANCEMENT or not self.valves.ARK_API_KEY:
                 return None
+
             text_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
             if text_hash in self.embedding_cache:
                 return self.embedding_cache[text_hash]
+
             try:
                 headers = {
                     "Authorization": f"Bearer {self.valves.ARK_API_KEY}",
                     "Content-Type": "application/json",
                 }
+
                 clean_text = text.strip()[:4000]
                 if not clean_text:
                     return None
+
                 payload = {
                     "model": self.valves.EMBEDDING_MODEL,
                     "input": [clean_text],
                     "encoding_format": "float",
                 }
+
                 response = await asyncio.to_thread(
                     requests.post,
                     f"{self.valves.EMBEDDING_BASE_URL}/embeddings",
@@ -2221,12 +2528,14 @@ class Tools:
                 )
                 response.raise_for_status()
                 data = response.json()
+
                 if "data" in data and len(data["data"]) > 0:
                     embedding = data["data"][0]["embedding"]
                     self.embedding_cache[text_hash] = embedding
                     return embedding
                 else:
                     return None
+
             except Exception:
                 return None
 
@@ -2291,6 +2600,7 @@ class Tools:
 
         try:
             debug_log(f"开始智能网页读取，URL数量: {len(urls)}")
+
             await progress_mgr.update_step(
                 f"🚀 开始处理 {len(urls)} 个网页", __event_emitter__
             )
@@ -2302,6 +2612,7 @@ class Tools:
                     "X-With-Links-Summary": "true",
                     "Authorization": f"Bearer {self.valves.JINA_API_KEY}",
                 }
+
                 try:
                     async with aiohttp.ClientSession() as session:
                         async with session.get(
@@ -2309,6 +2620,7 @@ class Tools:
                         ) as response:
                             response.raise_for_status()
                             content = await response.text()
+
                     if not content or content.strip() == "":
                         return {
                             "content": "",
@@ -2317,7 +2629,9 @@ class Tools:
                             "error": "返回内容为空",
                             "status": "empty",
                         }
+
                     debug_log(f"成功读取URL {url}，内容长度: {len(content)}")
+
                     return {
                         "content": content,
                         "title": f"网页内容 - {url.split('/')[2] if '/' in url else url}",
@@ -2327,6 +2641,7 @@ class Tools:
                         "source_type": "网页读取",
                         "status": "success",
                     }
+
                 except Exception as e:
                     error_message = f"读取网页 {url} 时出错: {str(e)}"
                     debug_log(f"处理URL失败: {url}", e)
@@ -2343,6 +2658,7 @@ class Tools:
 
             successful_results = []
             error_results = []
+
             for result in results:
                 if result.get("status") == "success" and result.get("content"):
                     successful_results.append(result)
@@ -2352,6 +2668,7 @@ class Tools:
             debug_log(
                 f"处理完成，成功: {len(successful_results)}, 失败: {len(error_results)}"
             )
+
             await progress_mgr.update_step(
                 f"📖 成功读取 {len(successful_results)} 个网页", __event_emitter__
             )
@@ -2372,11 +2689,14 @@ class Tools:
             # 智能摘要提取流程
             if self.valves.ENABLE_SMART_SUMMARY:
                 all_summaries = []
+
                 for i, page in enumerate(successful_results):
                     content = page.get("content", "")
                     url = page.get("url", "")
                     title = page.get("title", "")
+
                     debug_log(f"为页面 {i+1}/{len(successful_results)} 提取摘要: {url}")
+
                     try:
                         summaries = await extract_summaries_fixed(
                             content=content,
@@ -2405,6 +2725,7 @@ class Tools:
                         [user_request] + aspects + [s["content"] for s in all_summaries]
                     )
                     all_vecs = await batch_embeddings(all_texts)
+
                     query_vec = all_vecs[0] if all_vecs else None
                     aspect_vecs = (
                         all_vecs[1 : len(aspects) + 1]
@@ -2438,6 +2759,7 @@ class Tools:
                     all_summaries = dedup_by_embedding(
                         all_summaries, summary_vecs, thr=0.88
                     )
+
                     all_summaries.sort(
                         key=lambda x: x.get("rag_similarity", 0), reverse=True
                     )
@@ -2451,6 +2773,7 @@ class Tools:
                     await progress_mgr.update_step(
                         f"🎯 语义重排序 {len(all_summaries)} 条摘要", __event_emitter__
                     )
+
                     try:
                         headers = {
                             "Authorization": f"Bearer {self.valves.BOCHA_API_KEY}",
@@ -2460,6 +2783,7 @@ class Tools:
                         # 构造 documents 时建立映射
                         documents = []
                         doc_to_result_idx = []
+
                         for i, s in enumerate(all_summaries):
                             content = s["content"][:4000]
                             if content:
@@ -2474,6 +2798,7 @@ class Tools:
                                 "top_n": min(self.valves.RERANK_TOP_N, len(documents)),
                                 "return_documents": False,
                             }
+
                             resp = await asyncio.to_thread(
                                 requests.post,
                                 self.valves.RERANK_ENDPOINT,
@@ -2483,24 +2808,29 @@ class Tools:
                             )
                             resp.raise_for_status()
                             data = resp.json()
+
                             if "data" in data and "results" in data["data"]:
                                 rerank_results_data = data["data"]["results"]
                                 reranked_summaries = []
+
                                 # 回填时使用映射
                                 for rerank_item in rerank_results_data:
                                     doc_idx = rerank_item.get("index", 0)
                                     relevance_score = rerank_item.get(
                                         "relevance_score", 0.0
                                     )
+
                                     if 0 <= doc_idx < len(doc_to_result_idx):
                                         orig_idx = doc_to_result_idx[doc_idx]
                                         summary = all_summaries[orig_idx].copy()
                                         summary["rerank_score"] = relevance_score
                                         reranked_summaries.append(summary)
+
                                 all_summaries = reranked_summaries
                                 debug_log(
                                     f"重排序完成，保留 {len(all_summaries)} 条摘要"
                                 )
+
                     except Exception as e:
                         debug_log(f"语义重排序失败: {e}")
 
@@ -2520,6 +2850,7 @@ class Tools:
                 if all_summaries:
                     rags = [float(x.get("rag_similarity", 0)) for x in all_summaries]
                     rers = [float(x.get("rerank_score", 0)) for x in all_summaries]
+
                     rags_n, rers_n = map(zminmax, (rags, rers))
 
                     for i, s in enumerate(all_summaries):
@@ -2543,6 +2874,7 @@ class Tools:
                         if any(is_wikipedia(r["url"]) for r in successful_results):
                             thr = max(0.03, thr * 0.4)
                             debug_log(f"检测到维基百科，放宽阈值到: {thr}")
+
                         final_summaries = [
                             s
                             for s in final_summaries
@@ -2662,16 +2994,19 @@ class Tools:
         async def emit_citation_data(r: Dict, __event_emitter__, run_id: str, idx: int):
             if not (__event_emitter__ and self.valves.CITATION_LINKS):
                 return
+
             full_doc = r.get("content") or ""
             doc_for_emit = take_text(full_doc, self.valves.CITATION_DOC_MAX_CHARS)
             chunks = split_text_chunks(doc_for_emit, self.valves.CITATION_CHUNK_SIZE)
             base_title = (r.get("title") or "") or (r.get("url") or "Source")
             base_url = (r.get("url") or "").strip()
+
             for ci, chunk in enumerate(chunks, 1):
                 if self.valves.UNIQUE_REFERENCE_NAMES:
                     src_name = f"{base_title} | {base_url} | {run_id}#{idx}-{ci}-{uuid4().hex[:6]}"
                 else:
                     src_name = base_url or base_title
+
                 payload = {
                     "type": "citation",
                     "data": {
@@ -2690,6 +3025,7 @@ class Tools:
                     },
                 }
                 await __event_emitter__(payload)
+
                 if self.valves.PERSIST_CITATIONS:
                     self.citations_history.append(payload)
                     if len(self.citations_history) > self.valves.PERSIST_CITATIONS_MAX:
@@ -2728,6 +3064,7 @@ class Tools:
 
         try:
             debug_log(f"开始Raw网页读取，URL数量: {len(urls)}")
+
             await emit_status(
                 f"🌐 正在Raw读取 {len(urls)} 个网页", False, "web_search", urls
             )
@@ -2740,6 +3077,7 @@ class Tools:
                     "X-With-Links-Summary": "true",
                     "Authorization": f"Bearer {self.valves.JINA_API_KEY}",
                 }
+
                 try:
                     async with aiohttp.ClientSession() as session:
                         async with session.get(
@@ -2747,6 +3085,7 @@ class Tools:
                         ) as response:
                             response.raise_for_status()
                             content = await response.text()
+
                     if not content or content.strip() == "":
                         return {
                             "content": "",
@@ -2755,13 +3094,16 @@ class Tools:
                             "error": "返回内容为空",
                             "status": "empty",
                         }
+
                     debug_log(f"成功读取URL {url}，内容长度: {len(content)}")
+
                     return {
                         "content": content,
                         "title": f"网页内容 - {url.split('/')[2] if '/' in url else url}",
                         "url": url,
                         "status": "success",
                     }
+
                 except Exception as e:
                     error_message = f"读取网页 {url} 时出错: {str(e)}"
                     debug_log(f"处理URL失败: {url}", e)
@@ -2778,6 +3120,7 @@ class Tools:
 
             successful_results = []
             error_results = []
+
             for result in results:
                 if result.get("status") == "success" and result.get("content"):
                     successful_results.append(result)
@@ -2805,6 +3148,7 @@ class Tools:
                         ),
                     }
                     results_data.append(result_item)
+
                 return json.dumps(
                     {"results": results_data, "errors": error_results},
                     ensure_ascii=False,
@@ -2822,26 +3166,32 @@ class Tools:
 内容: {content}
 """
                     )
+
                 for result in error_results:
                     final_results.append(
                         f"""URL: {result['url']}
 错误: {result.get('error', '未知错误')}
 """
                     )
+
                 final_result = "\n".join(final_results)
                 if not final_result.strip():
                     final_result = "所有网页读取均失败。"
+
                 result_text = f"""Raw网页读取结果:
+
 📊 总URL数: {len(urls)}
 ✅ 成功读取: {len(successful_results)}
 ❌ 失败读取: {len(error_results)}
 
 原始网页内容:
 {final_result}"""
+
                 return result_text
 
         except Exception as e:
             debug_log("Raw网页读取失败", e)
+
             if self.valves.RAW_OUTPUT_FORMAT.lower() == "json":
                 return json.dumps(
                     {
@@ -2854,6 +3204,7 @@ class Tools:
                 )
             else:
                 return f"""❌ Raw网页读取出现错误: {str(e)}
+
 请检查网络连接和API配置。"""
 
     # ======================== AI智能搜索 ========================
@@ -2896,16 +3247,19 @@ class Tools:
         async def emit_citation_data(r: Dict, __event_emitter__, run_id: str, idx: int):
             if not (__event_emitter__ and self.valves.CITATION_LINKS):
                 return
+
             full_doc = r.get("content") or ""
             doc_for_emit = take_text(full_doc, self.valves.CITATION_DOC_MAX_CHARS)
             chunks = split_text_chunks(doc_for_emit, self.valves.CITATION_CHUNK_SIZE)
             base_title = (r.get("title") or "") or (r.get("url") or "Source")
             base_url = (r.get("url") or "").strip()
+
             for ci, chunk in enumerate(chunks, 1):
                 if self.valves.UNIQUE_REFERENCE_NAMES:
                     src_name = f"{base_title} | {base_url} | {run_id}#{idx}-{ci}-{uuid4().hex[:6]}"
                 else:
                     src_name = base_url or base_title
+
                 payload = {
                     "type": "citation",
                     "data": {
@@ -2924,6 +3278,7 @@ class Tools:
                     },
                 }
                 await __event_emitter__(payload)
+
                 if self.valves.PERSIST_CITATIONS:
                     self.citations_history.append(payload)
                     if len(self.citations_history) > self.valves.PERSIST_CITATIONS_MAX:
@@ -2968,6 +3323,7 @@ class Tools:
                 "Authorization": f"Bearer {self.valves.BOCHA_API_KEY}",
                 "Content-Type": "application/json",
             }
+
             payload = {
                 "query": query,
                 "freshness": self.valves.FRESHNESS,
@@ -2977,6 +3333,7 @@ class Tools:
             }
 
             await emit_status("⏳ 连接AI搜索服务器...")
+
             resp = requests.post(
                 self.valves.AI_SEARCH_ENDPOINT,
                 headers=headers,
@@ -3012,12 +3369,14 @@ class Tools:
                                 await emit_status(
                                     f"📄 处理 {len(content_obj['value'])} 个AI搜索结果..."
                                 )
+
                                 for i, item in enumerate(content_obj["value"]):
                                     search_content = item.get(
                                         "summary", ""
                                     ) or item.get("snippet", "")
                                     if not search_content:
                                         continue
+
                                     result_item = {
                                         "content": search_content,
                                         "title": item.get("name", ""),
@@ -3027,6 +3386,7 @@ class Tools:
                                         "source_type": "高级AI智能搜索",
                                     }
                                     source_context_list.append(result_item)
+
                         except json.JSONDecodeError as e:
                             debug_log("解析AI搜索结果JSON失败", e)
 
@@ -3106,14 +3466,14 @@ class Function:
     def __init__(self):
         self.tools = Tools()
 
-    # Kimi AI基础搜索
+    # Kimi AI基础搜索（修复版：强制联网）
     async def kimi_ai_search(
         self,
         search_query: str,
         context: str = "",
         __event_emitter__: Optional[Callable[[dict], Any]] = None,
     ) -> str:
-        """🌙 Kimi AI基础搜索 - 通用搜索功能"""
+        """🌙 Kimi AI联网搜索 - 强制使用内置$web_search工具进行真实联网搜索"""
         return await self.tools.kimi_ai_search(search_query, context, __event_emitter__)
 
     # 专业中文网页搜索
