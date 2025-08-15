@@ -4,7 +4,7 @@
 **Kimi AI + Bocha + RAG 优化 + LLM 智能摘要 + 链接噪声治理（完整修复版）**
 **Kimi AI + Bocha + RAG + LLM Map-Reduce Summaries + Link Noise Mitigation (Fixed)**
 
-> version: **3.8.2** · license: **MIT** · required\_open\_webui\_version: **0.4.0**
+> version: **3.8.3** · license: **MIT** · required\_open\_webui\_version: **0.4.0**
 
 **作者 / Author:** JiangNanGenius
 **GitHub:** [https://github.com/JiangNanGenius](https://github.com/JiangNanGenius)
