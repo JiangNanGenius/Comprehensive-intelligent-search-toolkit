@@ -1,11 +1,11 @@
 """
-title: 🔍 综合智能搜索工具集 - Kimi AI + Bocha + RAG优化 + LLM智能摘要 + 链接噪声治理 (完整修复版)
+title: 🔍 综合智能搜索工具集
 author: JiangNanGenius
 Github: https://github.com/JiangNanGenius
-description: 集成Kimi AI基础搜索、Bocha专业搜索、网页读取，支持LLM智能摘要提取、RAG向量化、语义重排序的智能搜索工具集，强化链接噪声治理和优雅回退，修复语法错误和分片重叠问题，实现并发LLM调用
+description: 集成Kimi/Bocha/LangSearch/网页读取，支持RAG与语义重排，统一引用展示。
 required_open_webui_version: 0.4.0
 requirements: openai>=1.0.0, requests, beautifulsoup4, numpy, aiohttp
-version: 3.9.3
+version: 3.9.4
 license: MIT
 """
 
@@ -47,6 +47,11 @@ class Tools:
             default="moonshot-v1-auto", description="🤖 Kimi使用的模型"
         )
         KIMI_TEMPERATURE: float = Field(default=0.3, description="🌡️ Kimi模型温度参数")
+        # Kimi 模型覆盖（仅对 Kimi 联网搜索生效）
+        KIMI_MODEL_OVERRIDE: str = Field(
+            default="",
+            description="🛠️ 覆盖 Kimi 搜索所用模型；留空则使用上面的 KIMI_MODEL（示例：moonshot-v1-128k、moonshot-v1-8k、kimi-latest）。",
+        )
 
         # Bocha 配置
         BOCHA_API_KEY: str = Field(
@@ -205,7 +210,7 @@ class Tools:
             default=True, description="🎯 引用名唯一，避免UI合并/折叠"
         )
         PERSIST_CITATIONS: bool = Field(
-            default=True, description="💾 多次调用时保留并重发历史引用"
+            default=False, description="💾 多次调用时保留并重发历史引用"
         )
         PERSIST_CITATIONS_MAX: int = Field(
             default=100, description="📚 历史引用最多保存条数"
@@ -250,14 +255,14 @@ class Tools:
         self.run_seq = 0
         self.citations_history = []
 
-    # ======================== Kimi AI 搜索（修复版：强制联网） ========================
+    # ======================== Kimi AI 搜索 ========================
     async def kimi_ai_search(
         self,
         search_query: str,
         context: str = "",
         __event_emitter__: Optional[Callable[[dict], Any]] = None,
     ) -> str:
-        """🌙 Kimi AI基础搜索（修复版：强制联网）"""
+        """🌙 Kimi AI基础搜索"""
 
         # === 内嵌工具函数 ===
         def get_kimi_client():
@@ -304,6 +309,231 @@ class Tools:
 
         async def emit_citation_data(r: Dict, __event_emitter__, run_id: str, idx: int):
             if not (__event_emitter__ and self.valves.CITATION_LINKS):
+                return
+
+            full_doc = r.get("content") or ""
+            doc_for = take_text(full_doc, self.valves.CITATION_DOC_MAX_CHARS)
+            chunks = split_text_chunks(doc_for, self.valves.CITATION_CHUNK_SIZE)
+            base_url = (r.get("url") or "").strip()
+            base_title = r.get("title") or ""
+            # 清理“来源 |/：”类前缀
+            try:
+                import re as _re
+
+                base_title = _re.sub(
+                    r"^\s*来源\s*[\|：:]+\s*", "", base_title or ""
+                ).strip()
+            except Exception:
+                pass
+
+            # 分组名：默认用 host（Kimi 会单独改为 host+path）
+            try:
+                from urllib.parse import urlparse
+
+                _p = urlparse(base_url or "")
+                _host = (_p.netloc or "").lower()
+            except Exception:
+                _host = ""
+            src_name = (
+                (_host + (_p.path.rstrip("/") or "/"))
+                if _host
+                else (base_title or "Source")
+            )
+
+            # 相关度：final_score → rag_similarity → rerank_score
+            rel = 0.0
+            try:
+                if r.get("final_score") is not None:
+                    rel = float(r.get("final_score") or 0.0)
+                elif r.get("rag_similarity") is not None:
+                    rel = float(r.get("rag_similarity") or 0.0)
+                elif r.get("rerank_score") is not None:
+                    rel = float(r.get("rerank_score") or 0.0)
+                rel = max(0.0, min(1.0, rel))
+            except Exception:
+                rel = 0.0
+
+            tool_tag = (run_id or "").split("-", 1)[0]
+            TOOL_MAP = {
+                "zh-web": "search_chinese_web",
+                "en-web": "search_english_web",
+                "web-scrape": "web_scrape",
+                "web-scrape-raw": "web_scrape_raw",
+                "ai-search": "search_ai_intelligent",
+                "kimi": "kimi_ai_search",
+            }
+            tool_name = TOOL_MAP.get(tool_tag, tool_tag)
+
+            payload = {
+                "type": "citation",
+                "data": {
+                    "document": chunks if chunks else [doc_for],
+                    "metadata": [
+                        {
+                            "source": base_url,
+                            "title": base_title or (_host or "Source"),
+                            "relevance": rel,
+                            "tool": tool_name,
+                            "run_id": run_id,
+                        }
+                    ],
+                    "source": {
+                        "name": src_name,  # ← 仅 host（Kimi 会在其函数里覆盖为 host+path）
+                        "url": base_url or "",
+                        "type": r.get("source_type", "webpage"),
+                    },
+                },
+            }
+            await __event_emitter__(payload)
+
+            if self.valves.PERSIST_CITATIONS:
+                self.citations_history.append(payload)
+                if len(self.citations_history) > self.valves.PERSIST_CITATIONS_MAX:
+                    self.citations_history = self.citations_history[
+                        -self.valves.PERSIST_CITATIONS_MAX :
+                    ]
+                return
+
+            full_doc = r.get("content") or ""
+            doc_for_emit = take_text(full_doc, self.valves.CITATION_DOC_MAX_CHARS)
+            chunks = split_text_chunks(doc_for_emit, self.valves.CITATION_CHUNK_SIZE)
+
+            base_url = (r.get("url") or "").strip()
+            base_title = r.get("title") or ""
+            # 标题兜底：若没有标题，用 host + 末段路径
+            if not base_title:
+                try:
+                    from urllib.parse import urlparse
+
+                    p = urlparse(base_url or "")
+                    host = (p.netloc or "").lower()
+                    tail = (p.path or "/").rstrip("/").split("/")[-1] or "/"
+                    base_title = f"{host} · {tail}" if host else (base_url or "Source")
+                except Exception:
+                    base_title = base_url or "Source"
+
+            # 统一分组：用 host 或兜底标题
+            try:
+                from urllib.parse import urlparse
+
+                p = urlparse(base_url or "")
+                host = (p.netloc or "").lower()
+            except Exception:
+                host = ""
+            src_name = (
+                (host + (p.path.rstrip("/") or "/"))
+                if host
+                else (base_title or "Source")
+            )
+
+            # relevance：final_score → rag_similarity → rerank_score（截到[0,1]）
+            rel = 0.0
+            try:
+                if r.get("final_score") is not None:
+                    rel = float(r.get("final_score") or 0.0)
+                elif r.get("rag_similarity") is not None:
+                    rel = float(r.get("rag_similarity") or 0.0)
+                elif r.get("rerank_score") is not None:
+                    rel = float(r.get("rerank_score") or 0.0)
+                rel = max(0.0, min(1.0, rel))
+            except Exception:
+                rel = 0.0
+
+            # 产出工具：从 run_id 推断（如 'zh-web-...', 'en-web-...', 'web-scrape', 'ai-search', 'kimi' 等）
+            tool_tag = (run_id or "").split("-", 1)[0]
+            TOOL_MAP = {
+                "zh-web": "search_chinese_web",
+                "en-web": "search_english_web",
+                "web-scrape": "web_scrape",
+                "web-scrape-raw": "web_scrape_raw",
+                "ai-search": "search_ai_intelligent",
+                "kimi": "kimi_ai_search",
+            }
+            tool_name = TOOL_MAP.get(tool_tag, tool_tag)
+
+            payload = {
+                "type": "citation",
+                "data": {
+                    "document": chunks if chunks else [doc_for_emit],
+                    "metadata": [
+                        {
+                            "source": base_url,
+                            "title": base_title,
+                            "relevance": rel,
+                            "tool": tool_name,
+                            "run_id": run_id,
+                        }
+                    ],
+                    "source": {
+                        "name": src_name,
+                        "url": base_url or "",
+                        "type": r.get("source_type", "webpage"),
+                    },
+                },
+            }
+            await __event_emitter__(payload)
+
+            if self.valves.PERSIST_CITATIONS:
+                self.citations_history.append(payload)
+                if len(self.citations_history) > self.valves.PERSIST_CITATIONS_MAX:
+                    self.citations_history = self.citations_history[
+                        -self.valves.PERSIST_CITATIONS_MAX :
+                    ]
+                return
+
+            full_doc = r.get("content") or ""
+            doc_for_emit = take_text(full_doc, self.valves.CITATION_DOC_MAX_CHARS)
+            chunks = split_text_chunks(doc_for_emit, self.valves.CITATION_CHUNK_SIZE)
+
+            # 标题兜底：无标题则用 host + 最末路径段
+            base_url = (r.get("url") or "").strip()
+            base_title = r.get("title") or ""
+            if not base_title:
+                try:
+                    from urllib.parse import urlparse
+
+                    p = urlparse(base_url or "")
+                    host = (p.netloc or "").lower()
+                    tail = (p.path or "/").rstrip("/").split("/")[-1] or "/"
+                    base_title = f"{host} · {tail}" if host else (base_url or "Source")
+                except Exception:
+                    base_title = base_url or "Source"
+
+            # relevance：final_score → rag_similarity → rerank_score，并截到[0,1]
+            rel = 0.0
+            try:
+                if r.get("final_score") is not None:
+                    rel = float(r.get("final_score") or 0.0)
+                elif r.get("rag_similarity") is not None:
+                    rel = float(r.get("rag_similarity") or 0.0)
+                elif r.get("rerank_score") is not None:
+                    rel = float(r.get("rerank_score") or 0.0)
+                rel = max(0.0, min(1.0, rel))
+            except Exception:
+                rel = 0.0
+
+            payload = {
+                "type": "citation",
+                "data": {
+                    "document": chunks if chunks else [doc_for_emit],
+                    "metadata": [
+                        {"source": base_url, "title": base_title, "relevance": rel}
+                    ],
+                    "source": {
+                        "name": base_title,
+                        "url": base_url or "",
+                        "type": r.get("source_type", "webpage"),
+                    },
+                },
+            }
+            await __event_emitter__(payload)
+
+            if self.valves.PERSIST_CITATIONS:
+                self.citations_history.append(payload)
+                if len(self.citations_history) > self.valves.PERSIST_CITATIONS_MAX:
+                    self.citations_history = self.citations_history[
+                        -self.valves.PERSIST_CITATIONS_MAX :
+                    ]
                 return
 
             full_doc = r.get("content") or ""
@@ -383,20 +613,18 @@ class Tools:
 
         async def chat_with_tool_calls(messages: list) -> tuple:
             """
-            使用工具调用方式与Kimi交互，强制进行联网搜索
+
             返回: (final_response, search_used, search_results)
             """
             client = get_kimi_client()
 
-            # 使用支持更大上下文的模型
-            model_to_use = "moonshot-v1-auto"
-            if "kimi" in self.valves.KIMI_MODEL.lower():
-                model_to_use = self.valves.KIMI_MODEL
-            elif "moonshot" in self.valves.KIMI_MODEL.lower():
-                model_to_use = self.valves.KIMI_MODEL
-            else:
-                # 默认使用auto模型
-                model_to_use = "moonshot-v1-auto"
+            # 选择模型（优先覆盖项 -> 全局KIMI_MODEL -> 默认）
+
+            model_to_use = (
+                (self.valves.KIMI_MODEL_OVERRIDE or "").strip()
+                or (self.valves.KIMI_MODEL or "").strip()
+                or "moonshot-v1-auto"
+            )
 
             debug_log(f"使用模型: {model_to_use}")
 
@@ -504,90 +732,112 @@ class Tools:
 
         def parse_kimi_response(content: str, search_results: List[Dict]) -> tuple:
             """
-            解析Kimi的响应内容，提取结构化信息
-            返回: (parsed_results, sources)
+            解析Kimi的响应内容，提取结构化信息（更稳健的链接->标题映射）
+            返回: (parsed_results, urls)
             """
             debug_log(f"解析Kimi响应内容: {content[:300]}...")
 
-            # 从搜索结果中提取URL信息
+            # 1) 从工具调用结果里收集URL
             urls_from_search = []
             for sr in search_results:
                 args = sr.get("arguments", {})
-                if "urls" in args:
-                    urls_from_search.extend(args["urls"])
-                elif "url" in args:
-                    urls_from_search.append(args["url"])
+                if isinstance(args, dict):
+                    if "urls" in args and isinstance(args["urls"], list):
+                        urls_from_search.extend(
+                            [u for u in args["urls"] if isinstance(u, str)]
+                        )
+                    elif "url" in args and isinstance(args["url"], str):
+                        urls_from_search.append(args["url"])
 
-            # 从内容中提取链接
-            url_pattern = r'https?://[^\s\)\]\}，。；！？"\']*'
-            urls_from_content = re.findall(url_pattern, content)
+            # 2) 在文本中提取 Markdown 链接与裸URL
+            md_link_pat = re.compile(r"\[([^\]]+)\]\((https?://[^\s\)]+)\)")
+            url_pat = re.compile(r'https?://[^\s\)\]\}，。；！？"\']+')
+            pairs = []  # (title,url,paragraph)
 
-            # 合并所有URL
-            all_urls = list(set(urls_from_search + urls_from_content))
-            debug_log(f"提取到的URLs: {all_urls}")
+            # 标准 markdown 链接优先
+            for m in md_link_pat.finditer(content):
+                title = (m.group(1) or "").strip()
+                url = (m.group(2) or "").strip()
+                # 找到该链接所在段落（用于snippet）
+                para_start = content.rfind("\n\n", 0, m.start())
+                para_end = content.find("\n\n", m.end())
+                if para_start == -1:
+                    para_start = 0
+                if para_end == -1:
+                    para_end = len(content)
+                paragraph = content[para_start:para_end].strip()
+                pairs.append((title, url, paragraph))
 
-            # 尝试按段落分割内容
-            paragraphs = [p.strip() for p in content.split("\n\n") if p.strip()]
+            # 裸链接作为补充：取最近的上一行/上一句作为标题
+            for m in url_pat.finditer(content):
+                url = m.group(0).strip()
+                # 跳过已经覆盖的 markdown 链接
+                if any(url == p[1] for p in pairs):
+                    continue
+                # 取最近的上一行前30~80字符作为title候选
+                line_start = content.rfind("\n", 0, m.start())
+                prev_line_start = content.rfind("\n", 0, max(0, line_start - 1))
+                ctx = content[max(0, prev_line_start + 1) : line_start].strip()
+                title = ctx[-80:].strip() if ctx else ""
+                pairs.append((title, url, ctx))
+
+            # 3) 汇总URL（去重，按规范化 host+path）
+            def canon(u: str) -> str:
+                try:
+                    from urllib.parse import urlparse
+
+                    p = urlparse(u or "")
+                    return (p.netloc or "").lower() + (p.path.rstrip("/") or "/")
+                except Exception:
+                    return (u or "").strip()
+
+            seen = set()
+            merged = []
+            for title, url, para in pairs:
+                if not url:
+                    continue
+                c = canon(url)
+                if c in seen:
+                    continue
+                seen.add(c)
+                merged.append((title, url, para))
+
+            # 4) 若 pairs 为空，则用原有 fallback 逻辑构造一个条目
+            if not merged and urls_from_search:
+                url0 = urls_from_search[0]
+                merged = [("搜索结果", url0, content.strip())]
+
+            # 5) 过滤“纯提示/综述”标题（如“以下是关于…最新信息”）
+            def looks_like_header(t: str) -> bool:
+                if not t:
+                    return False
+                bad = ("以下是关于", "最新信息", "Here are", "Overview", "Summary")
+                return any(b in t for b in bad)
 
             parsed_results = []
+            for title, url, para in merged:
+                if looks_like_header(title) and len(merged) > 1:
+                    # 跳过通用头部
+                    continue
+                site = ""
+                try:
+                    from urllib.parse import urlparse
 
-            # 如果内容有明显的结构化信息
-            if any(
-                marker in content for marker in ["1.", "2.", "一、", "二、", "##", "**"]
-            ):
-                # 尝试解析结构化内容
-                sections = re.split(r"\n(?=\d+\.|\w+、|##|\*\*)", content)
-                for i, section in enumerate(sections):
-                    section = section.strip()
-                    if not section:
-                        continue
-
-                    # 提取标题（第一行）
-                    lines = section.split("\n")
-                    title = lines[0].strip("*#").strip()
-                    content_text = (
-                        "\n".join(lines[1:]).strip() if len(lines) > 1 else section
-                    )
-
-                    # 为每个段落分配URL
-                    section_url = ""
-                    if i < len(all_urls):
-                        section_url = all_urls[i]
-                    elif all_urls:
-                        section_url = all_urls[0]  # 使用第一个URL作为默认
-
-                    parsed_results.append(
-                        {
-                            "title": title or f"搜索结果 {i+1}",
-                            "content": content_text or section,
-                            "url": section_url,
-                            "site_name": (
-                                section_url.split("/")[2]
-                                if section_url and "/" in section_url
-                                else "Kimi搜索"
-                            ),
-                            "date_published": datetime.now().strftime("%Y-%m-%d"),
-                            "source_type": "Kimi AI联网搜索",
-                        }
-                    )
-            else:
-                # 没有明显结构，将整个内容作为一个结果
-                main_url = all_urls[0] if all_urls else ""
+                    site = (urlparse(url).netloc or "").lower()
+                except Exception:
+                    pass
                 parsed_results.append(
                     {
-                        "title": f"关于 {search_query}",
-                        "content": content,
-                        "url": main_url,
-                        "site_name": (
-                            main_url.split("/")[2]
-                            if main_url and "/" in main_url
-                            else "Kimi搜索"
-                        ),
+                        "title": title or site or "搜索结果",
+                        "content": para or title or "",
+                        "url": url,
+                        "site_name": site or "",
                         "date_published": datetime.now().strftime("%Y-%m-%d"),
                         "source_type": "Kimi AI联网搜索",
                     }
                 )
 
+            all_urls = [r["url"] for r in parsed_results if r.get("url")]
             debug_log(f"解析完成，得到 {len(parsed_results)} 个结果")
             return parsed_results, all_urls
 
@@ -695,6 +945,23 @@ class Tools:
                 final_content, all_search_results
             )
 
+            # 去重：按规范化URL合并重复
+            try:
+                from urllib.parse import urlparse
+
+                seen = set()
+                uniq = []
+                for _r in parsed_results:
+                    _u = (_r.get("url") or "").strip()
+                    _p = urlparse(_u or "")
+                    _canon = (_p.netloc or "").lower() + (_p.path.rstrip("/") or "/")
+                    if _canon in seen:
+                        continue
+                    seen.add(_canon)
+                    uniq.append(_r)
+                parsed_results = uniq
+            except Exception:
+                pass
             # 发送引用数据
             for idx, r in enumerate(parsed_results):
                 await emit_citation_data(r, __event_emitter__, run_id, idx)
@@ -790,6 +1057,223 @@ class Tools:
 
         async def emit_citation_data(r: Dict, __event_emitter__, run_id: str, idx: int):
             if not (__event_emitter__ and self.valves.CITATION_LINKS):
+                return
+
+            full_doc = r.get("content") or ""
+            doc_for = take_text(full_doc, self.valves.CITATION_DOC_MAX_CHARS)
+            chunks = split_text_chunks(doc_for, self.valves.CITATION_CHUNK_SIZE)
+            base_url = (r.get("url") or "").strip()
+            base_title = r.get("title") or ""
+            # 清理“来源 |/：”类前缀
+            try:
+                import re as _re
+
+                base_title = _re.sub(
+                    r"^\s*来源\s*[\|：:]+\s*", "", base_title or ""
+                ).strip()
+            except Exception:
+                pass
+
+            # 分组名：默认用 host（Kimi 会单独改为 host+path）
+            try:
+                from urllib.parse import urlparse
+
+                _p = urlparse(base_url or "")
+                _host = (_p.netloc or "").lower()
+            except Exception:
+                _host = ""
+            src_name = _host or (base_title or "Source")
+
+            # 相关度：final_score → rag_similarity → rerank_score
+            rel = 0.0
+            try:
+                if r.get("final_score") is not None:
+                    rel = float(r.get("final_score") or 0.0)
+                elif r.get("rag_similarity") is not None:
+                    rel = float(r.get("rag_similarity") or 0.0)
+                elif r.get("rerank_score") is not None:
+                    rel = float(r.get("rerank_score") or 0.0)
+                rel = max(0.0, min(1.0, rel))
+            except Exception:
+                rel = 0.0
+
+            tool_tag = (run_id or "").split("-", 1)[0]
+            TOOL_MAP = {
+                "zh-web": "search_chinese_web",
+                "en-web": "search_english_web",
+                "web-scrape": "web_scrape",
+                "web-scrape-raw": "web_scrape_raw",
+                "ai-search": "search_ai_intelligent",
+                "kimi": "kimi_ai_search",
+            }
+            tool_name = TOOL_MAP.get(tool_tag, tool_tag)
+
+            payload = {
+                "type": "citation",
+                "data": {
+                    "document": chunks if chunks else [doc_for],
+                    "metadata": [
+                        {
+                            "source": base_url,
+                            "title": base_title or (_host or "Source"),
+                            "relevance": rel,
+                            "tool": tool_name,
+                            "run_id": run_id,
+                        }
+                    ],
+                    "source": {
+                        "name": src_name,  # ← 仅 host（Kimi 会在其函数里覆盖为 host+path）
+                        "url": base_url or "",
+                        "type": r.get("source_type", "webpage"),
+                    },
+                },
+            }
+            await __event_emitter__(payload)
+
+            if self.valves.PERSIST_CITATIONS:
+                self.citations_history.append(payload)
+                if len(self.citations_history) > self.valves.PERSIST_CITATIONS_MAX:
+                    self.citations_history = self.citations_history[
+                        -self.valves.PERSIST_CITATIONS_MAX :
+                    ]
+                return
+
+            full_doc = r.get("content") or ""
+            doc_for_emit = take_text(full_doc, self.valves.CITATION_DOC_MAX_CHARS)
+            chunks = split_text_chunks(doc_for_emit, self.valves.CITATION_CHUNK_SIZE)
+
+            base_url = (r.get("url") or "").strip()
+            base_title = r.get("title") or ""
+            # 标题兜底：若没有标题，用 host + 末段路径
+            if not base_title:
+                try:
+                    from urllib.parse import urlparse
+
+                    p = urlparse(base_url or "")
+                    host = (p.netloc or "").lower()
+                    tail = (p.path or "/").rstrip("/").split("/")[-1] or "/"
+                    base_title = f"{host} · {tail}" if host else (base_url or "Source")
+                except Exception:
+                    base_title = base_url or "Source"
+
+            # 统一分组：用 host 或兜底标题
+            try:
+                from urllib.parse import urlparse
+
+                p = urlparse(base_url or "")
+                host = (p.netloc or "").lower()
+            except Exception:
+                host = ""
+            src_name = host or (base_title or "Source")
+
+            # relevance：final_score → rag_similarity → rerank_score（截到[0,1]）
+            rel = 0.0
+            try:
+                if r.get("final_score") is not None:
+                    rel = float(r.get("final_score") or 0.0)
+                elif r.get("rag_similarity") is not None:
+                    rel = float(r.get("rag_similarity") or 0.0)
+                elif r.get("rerank_score") is not None:
+                    rel = float(r.get("rerank_score") or 0.0)
+                rel = max(0.0, min(1.0, rel))
+            except Exception:
+                rel = 0.0
+
+            # 产出工具：从 run_id 推断（如 'zh-web-...', 'en-web-...', 'web-scrape', 'ai-search', 'kimi' 等）
+            tool_tag = (run_id or "").split("-", 1)[0]
+            TOOL_MAP = {
+                "zh-web": "search_chinese_web",
+                "en-web": "search_english_web",
+                "web-scrape": "web_scrape",
+                "web-scrape-raw": "web_scrape_raw",
+                "ai-search": "search_ai_intelligent",
+                "kimi": "kimi_ai_search",
+            }
+            tool_name = TOOL_MAP.get(tool_tag, tool_tag)
+
+            payload = {
+                "type": "citation",
+                "data": {
+                    "document": chunks if chunks else [doc_for_emit],
+                    "metadata": [
+                        {
+                            "source": base_url,
+                            "title": base_title,
+                            "relevance": rel,
+                            "tool": tool_name,
+                            "run_id": run_id,
+                        }
+                    ],
+                    "source": {
+                        "name": src_name,
+                        "url": base_url or "",
+                        "type": r.get("source_type", "webpage"),
+                    },
+                },
+            }
+            await __event_emitter__(payload)
+
+            if self.valves.PERSIST_CITATIONS:
+                self.citations_history.append(payload)
+                if len(self.citations_history) > self.valves.PERSIST_CITATIONS_MAX:
+                    self.citations_history = self.citations_history[
+                        -self.valves.PERSIST_CITATIONS_MAX :
+                    ]
+                return
+
+            full_doc = r.get("content") or ""
+            doc_for_emit = take_text(full_doc, self.valves.CITATION_DOC_MAX_CHARS)
+            chunks = split_text_chunks(doc_for_emit, self.valves.CITATION_CHUNK_SIZE)
+
+            # 标题兜底：无标题则用 host + 最末路径段
+            base_url = (r.get("url") or "").strip()
+            base_title = r.get("title") or ""
+            if not base_title:
+                try:
+                    from urllib.parse import urlparse
+
+                    p = urlparse(base_url or "")
+                    host = (p.netloc or "").lower()
+                    tail = (p.path or "/").rstrip("/").split("/")[-1] or "/"
+                    base_title = f"{host} · {tail}" if host else (base_url or "Source")
+                except Exception:
+                    base_title = base_url or "Source"
+
+            # relevance：final_score → rag_similarity → rerank_score，并截到[0,1]
+            rel = 0.0
+            try:
+                if r.get("final_score") is not None:
+                    rel = float(r.get("final_score") or 0.0)
+                elif r.get("rag_similarity") is not None:
+                    rel = float(r.get("rag_similarity") or 0.0)
+                elif r.get("rerank_score") is not None:
+                    rel = float(r.get("rerank_score") or 0.0)
+                rel = max(0.0, min(1.0, rel))
+            except Exception:
+                rel = 0.0
+
+            payload = {
+                "type": "citation",
+                "data": {
+                    "document": chunks if chunks else [doc_for_emit],
+                    "metadata": [
+                        {"source": base_url, "title": base_title, "relevance": rel}
+                    ],
+                    "source": {
+                        "name": base_title,
+                        "url": base_url or "",
+                        "type": r.get("source_type", "webpage"),
+                    },
+                },
+            }
+            await __event_emitter__(payload)
+
+            if self.valves.PERSIST_CITATIONS:
+                self.citations_history.append(payload)
+                if len(self.citations_history) > self.valves.PERSIST_CITATIONS_MAX:
+                    self.citations_history = self.citations_history[
+                        -self.valves.PERSIST_CITATIONS_MAX :
+                    ]
                 return
 
             full_doc = r.get("content") or ""
@@ -1315,6 +1799,223 @@ class Tools:
                 return
 
             full_doc = r.get("content") or ""
+            doc_for = take_text(full_doc, self.valves.CITATION_DOC_MAX_CHARS)
+            chunks = split_text_chunks(doc_for, self.valves.CITATION_CHUNK_SIZE)
+            base_url = (r.get("url") or "").strip()
+            base_title = r.get("title") or ""
+            # 清理“来源 |/：”类前缀
+            try:
+                import re as _re
+
+                base_title = _re.sub(
+                    r"^\s*来源\s*[\|：:]+\s*", "", base_title or ""
+                ).strip()
+            except Exception:
+                pass
+
+            # 分组名：默认用 host（Kimi 会单独改为 host+path）
+            try:
+                from urllib.parse import urlparse
+
+                _p = urlparse(base_url or "")
+                _host = (_p.netloc or "").lower()
+            except Exception:
+                _host = ""
+            src_name = _host or (base_title or "Source")
+
+            # 相关度：final_score → rag_similarity → rerank_score
+            rel = 0.0
+            try:
+                if r.get("final_score") is not None:
+                    rel = float(r.get("final_score") or 0.0)
+                elif r.get("rag_similarity") is not None:
+                    rel = float(r.get("rag_similarity") or 0.0)
+                elif r.get("rerank_score") is not None:
+                    rel = float(r.get("rerank_score") or 0.0)
+                rel = max(0.0, min(1.0, rel))
+            except Exception:
+                rel = 0.0
+
+            tool_tag = (run_id or "").split("-", 1)[0]
+            TOOL_MAP = {
+                "zh-web": "search_chinese_web",
+                "en-web": "search_english_web",
+                "web-scrape": "web_scrape",
+                "web-scrape-raw": "web_scrape_raw",
+                "ai-search": "search_ai_intelligent",
+                "kimi": "kimi_ai_search",
+            }
+            tool_name = TOOL_MAP.get(tool_tag, tool_tag)
+
+            payload = {
+                "type": "citation",
+                "data": {
+                    "document": chunks if chunks else [doc_for],
+                    "metadata": [
+                        {
+                            "source": base_url,
+                            "title": base_title or (_host or "Source"),
+                            "relevance": rel,
+                            "tool": tool_name,
+                            "run_id": run_id,
+                        }
+                    ],
+                    "source": {
+                        "name": src_name,  # ← 仅 host（Kimi 会在其函数里覆盖为 host+path）
+                        "url": base_url or "",
+                        "type": r.get("source_type", "webpage"),
+                    },
+                },
+            }
+            await __event_emitter__(payload)
+
+            if self.valves.PERSIST_CITATIONS:
+                self.citations_history.append(payload)
+                if len(self.citations_history) > self.valves.PERSIST_CITATIONS_MAX:
+                    self.citations_history = self.citations_history[
+                        -self.valves.PERSIST_CITATIONS_MAX :
+                    ]
+                return
+
+            full_doc = r.get("content") or ""
+            doc_for_emit = take_text(full_doc, self.valves.CITATION_DOC_MAX_CHARS)
+            chunks = split_text_chunks(doc_for_emit, self.valves.CITATION_CHUNK_SIZE)
+
+            base_url = (r.get("url") or "").strip()
+            base_title = r.get("title") or ""
+            # 标题兜底：若没有标题，用 host + 末段路径
+            if not base_title:
+                try:
+                    from urllib.parse import urlparse
+
+                    p = urlparse(base_url or "")
+                    host = (p.netloc or "").lower()
+                    tail = (p.path or "/").rstrip("/").split("/")[-1] or "/"
+                    base_title = f"{host} · {tail}" if host else (base_url or "Source")
+                except Exception:
+                    base_title = base_url or "Source"
+
+            # 统一分组：用 host 或兜底标题
+            try:
+                from urllib.parse import urlparse
+
+                p = urlparse(base_url or "")
+                host = (p.netloc or "").lower()
+            except Exception:
+                host = ""
+            src_name = host or (base_title or "Source")
+
+            # relevance：final_score → rag_similarity → rerank_score（截到[0,1]）
+            rel = 0.0
+            try:
+                if r.get("final_score") is not None:
+                    rel = float(r.get("final_score") or 0.0)
+                elif r.get("rag_similarity") is not None:
+                    rel = float(r.get("rag_similarity") or 0.0)
+                elif r.get("rerank_score") is not None:
+                    rel = float(r.get("rerank_score") or 0.0)
+                rel = max(0.0, min(1.0, rel))
+            except Exception:
+                rel = 0.0
+
+            # 产出工具：从 run_id 推断（如 'zh-web-...', 'en-web-...', 'web-scrape', 'ai-search', 'kimi' 等）
+            tool_tag = (run_id or "").split("-", 1)[0]
+            TOOL_MAP = {
+                "zh-web": "search_chinese_web",
+                "en-web": "search_english_web",
+                "web-scrape": "web_scrape",
+                "web-scrape-raw": "web_scrape_raw",
+                "ai-search": "search_ai_intelligent",
+                "kimi": "kimi_ai_search",
+            }
+            tool_name = TOOL_MAP.get(tool_tag, tool_tag)
+
+            payload = {
+                "type": "citation",
+                "data": {
+                    "document": chunks if chunks else [doc_for_emit],
+                    "metadata": [
+                        {
+                            "source": base_url,
+                            "title": base_title,
+                            "relevance": rel,
+                            "tool": tool_name,
+                            "run_id": run_id,
+                        }
+                    ],
+                    "source": {
+                        "name": src_name,
+                        "url": base_url or "",
+                        "type": r.get("source_type", "webpage"),
+                    },
+                },
+            }
+            await __event_emitter__(payload)
+
+            if self.valves.PERSIST_CITATIONS:
+                self.citations_history.append(payload)
+                if len(self.citations_history) > self.valves.PERSIST_CITATIONS_MAX:
+                    self.citations_history = self.citations_history[
+                        -self.valves.PERSIST_CITATIONS_MAX :
+                    ]
+                return
+
+            full_doc = r.get("content") or ""
+            doc_for_emit = take_text(full_doc, self.valves.CITATION_DOC_MAX_CHARS)
+            chunks = split_text_chunks(doc_for_emit, self.valves.CITATION_CHUNK_SIZE)
+
+            # 标题兜底：无标题则用 host + 最末路径段
+            base_url = (r.get("url") or "").strip()
+            base_title = r.get("title") or ""
+            if not base_title:
+                try:
+                    from urllib.parse import urlparse
+
+                    p = urlparse(base_url or "")
+                    host = (p.netloc or "").lower()
+                    tail = (p.path or "/").rstrip("/").split("/")[-1] or "/"
+                    base_title = f"{host} · {tail}" if host else (base_url or "Source")
+                except Exception:
+                    base_title = base_url or "Source"
+
+            # relevance：final_score → rag_similarity → rerank_score，并截到[0,1]
+            rel = 0.0
+            try:
+                if r.get("final_score") is not None:
+                    rel = float(r.get("final_score") or 0.0)
+                elif r.get("rag_similarity") is not None:
+                    rel = float(r.get("rag_similarity") or 0.0)
+                elif r.get("rerank_score") is not None:
+                    rel = float(r.get("rerank_score") or 0.0)
+                rel = max(0.0, min(1.0, rel))
+            except Exception:
+                rel = 0.0
+
+            payload = {
+                "type": "citation",
+                "data": {
+                    "document": chunks if chunks else [doc_for_emit],
+                    "metadata": [
+                        {"source": base_url, "title": base_title, "relevance": rel}
+                    ],
+                    "source": {
+                        "name": base_title,
+                        "url": base_url or "",
+                        "type": r.get("source_type", "webpage"),
+                    },
+                },
+            }
+            await __event_emitter__(payload)
+
+            if self.valves.PERSIST_CITATIONS:
+                self.citations_history.append(payload)
+                if len(self.citations_history) > self.valves.PERSIST_CITATIONS_MAX:
+                    self.citations_history = self.citations_history[
+                        -self.valves.PERSIST_CITATIONS_MAX :
+                    ]
+                return
+
+            full_doc = r.get("content") or ""
             doc_for_emit = take_text(full_doc, self.valves.CITATION_DOC_MAX_CHARS)
             chunks = split_text_chunks(doc_for_emit, self.valves.CITATION_CHUNK_SIZE)
             base_title = (r.get("title") or "") or (r.get("url") or "Source")
@@ -1779,14 +2480,14 @@ class Tools:
             )
             return json.dumps(error_details, ensure_ascii=False, indent=2)
 
-    # ======================== 智能网页读取功能（修复版） ========================
+    # ======================== 智能网页读取功能 ========================
     async def web_scrape(
         self,
         urls: List[str],
         user_request: str,
         __event_emitter__: Optional[Callable[[dict], Any]] = None,
     ) -> str:
-        """🌐 智能网页读取工具 (修复版)"""
+        """🌐 智能网页读取工具"""
 
         # === 表格扁平化工具函数 ===
         def _flatten_md_tables(text: str) -> str:
@@ -2000,7 +2701,7 @@ class Tools:
         async def llm_call(
             messages: list, temperature: float = None, max_tokens: int = 4000
         ) -> str:
-            """调用LLM（修复版：重试+线程池+超时）"""
+            """调用LLM"""
             client = get_segmenter_client()
             temp = (
                 temperature
@@ -2073,6 +2774,223 @@ class Tools:
                 return
 
             full_doc = r.get("content") or ""
+            doc_for = take_text(full_doc, self.valves.CITATION_DOC_MAX_CHARS)
+            chunks = split_text_chunks(doc_for, self.valves.CITATION_CHUNK_SIZE)
+            base_url = (r.get("url") or "").strip()
+            base_title = r.get("title") or ""
+            # 清理“来源 |/：”类前缀
+            try:
+                import re as _re
+
+                base_title = _re.sub(
+                    r"^\s*来源\s*[\|：:]+\s*", "", base_title or ""
+                ).strip()
+            except Exception:
+                pass
+
+            # 分组名：默认用 host（Kimi 会单独改为 host+path）
+            try:
+                from urllib.parse import urlparse
+
+                _p = urlparse(base_url or "")
+                _host = (_p.netloc or "").lower()
+            except Exception:
+                _host = ""
+            src_name = _host or (base_title or "Source")
+
+            # 相关度：final_score → rag_similarity → rerank_score
+            rel = 0.0
+            try:
+                if r.get("final_score") is not None:
+                    rel = float(r.get("final_score") or 0.0)
+                elif r.get("rag_similarity") is not None:
+                    rel = float(r.get("rag_similarity") or 0.0)
+                elif r.get("rerank_score") is not None:
+                    rel = float(r.get("rerank_score") or 0.0)
+                rel = max(0.0, min(1.0, rel))
+            except Exception:
+                rel = 0.0
+
+            tool_tag = (run_id or "").split("-", 1)[0]
+            TOOL_MAP = {
+                "zh-web": "search_chinese_web",
+                "en-web": "search_english_web",
+                "web-scrape": "web_scrape",
+                "web-scrape-raw": "web_scrape_raw",
+                "ai-search": "search_ai_intelligent",
+                "kimi": "kimi_ai_search",
+            }
+            tool_name = TOOL_MAP.get(tool_tag, tool_tag)
+
+            payload = {
+                "type": "citation",
+                "data": {
+                    "document": chunks if chunks else [doc_for],
+                    "metadata": [
+                        {
+                            "source": base_url,
+                            "title": base_title or (_host or "Source"),
+                            "relevance": rel,
+                            "tool": tool_name,
+                            "run_id": run_id,
+                        }
+                    ],
+                    "source": {
+                        "name": src_name,  # ← 仅 host（Kimi 会在其函数里覆盖为 host+path）
+                        "url": base_url or "",
+                        "type": r.get("source_type", "webpage"),
+                    },
+                },
+            }
+            await __event_emitter__(payload)
+
+            if self.valves.PERSIST_CITATIONS:
+                self.citations_history.append(payload)
+                if len(self.citations_history) > self.valves.PERSIST_CITATIONS_MAX:
+                    self.citations_history = self.citations_history[
+                        -self.valves.PERSIST_CITATIONS_MAX :
+                    ]
+                return
+
+            full_doc = r.get("content") or ""
+            doc_for_emit = take_text(full_doc, self.valves.CITATION_DOC_MAX_CHARS)
+            chunks = split_text_chunks(doc_for_emit, self.valves.CITATION_CHUNK_SIZE)
+
+            base_url = (r.get("url") or "").strip()
+            base_title = r.get("title") or ""
+            # 标题兜底：若没有标题，用 host + 末段路径
+            if not base_title:
+                try:
+                    from urllib.parse import urlparse
+
+                    p = urlparse(base_url or "")
+                    host = (p.netloc or "").lower()
+                    tail = (p.path or "/").rstrip("/").split("/")[-1] or "/"
+                    base_title = f"{host} · {tail}" if host else (base_url or "Source")
+                except Exception:
+                    base_title = base_url or "Source"
+
+            # 统一分组：用 host 或兜底标题
+            try:
+                from urllib.parse import urlparse
+
+                p = urlparse(base_url or "")
+                host = (p.netloc or "").lower()
+            except Exception:
+                host = ""
+            src_name = host or (base_title or "Source")
+
+            # relevance：final_score → rag_similarity → rerank_score（截到[0,1]）
+            rel = 0.0
+            try:
+                if r.get("final_score") is not None:
+                    rel = float(r.get("final_score") or 0.0)
+                elif r.get("rag_similarity") is not None:
+                    rel = float(r.get("rag_similarity") or 0.0)
+                elif r.get("rerank_score") is not None:
+                    rel = float(r.get("rerank_score") or 0.0)
+                rel = max(0.0, min(1.0, rel))
+            except Exception:
+                rel = 0.0
+
+            # 产出工具：从 run_id 推断（如 'zh-web-...', 'en-web-...', 'web-scrape', 'ai-search', 'kimi' 等）
+            tool_tag = (run_id or "").split("-", 1)[0]
+            TOOL_MAP = {
+                "zh-web": "search_chinese_web",
+                "en-web": "search_english_web",
+                "web-scrape": "web_scrape",
+                "web-scrape-raw": "web_scrape_raw",
+                "ai-search": "search_ai_intelligent",
+                "kimi": "kimi_ai_search",
+            }
+            tool_name = TOOL_MAP.get(tool_tag, tool_tag)
+
+            payload = {
+                "type": "citation",
+                "data": {
+                    "document": chunks if chunks else [doc_for_emit],
+                    "metadata": [
+                        {
+                            "source": base_url,
+                            "title": base_title,
+                            "relevance": rel,
+                            "tool": tool_name,
+                            "run_id": run_id,
+                        }
+                    ],
+                    "source": {
+                        "name": src_name,
+                        "url": base_url or "",
+                        "type": r.get("source_type", "webpage"),
+                    },
+                },
+            }
+            await __event_emitter__(payload)
+
+            if self.valves.PERSIST_CITATIONS:
+                self.citations_history.append(payload)
+                if len(self.citations_history) > self.valves.PERSIST_CITATIONS_MAX:
+                    self.citations_history = self.citations_history[
+                        -self.valves.PERSIST_CITATIONS_MAX :
+                    ]
+                return
+
+            full_doc = r.get("content") or ""
+            doc_for_emit = take_text(full_doc, self.valves.CITATION_DOC_MAX_CHARS)
+            chunks = split_text_chunks(doc_for_emit, self.valves.CITATION_CHUNK_SIZE)
+
+            # 标题兜底：无标题则用 host + 最末路径段
+            base_url = (r.get("url") or "").strip()
+            base_title = r.get("title") or ""
+            if not base_title:
+                try:
+                    from urllib.parse import urlparse
+
+                    p = urlparse(base_url or "")
+                    host = (p.netloc or "").lower()
+                    tail = (p.path or "/").rstrip("/").split("/")[-1] or "/"
+                    base_title = f"{host} · {tail}" if host else (base_url or "Source")
+                except Exception:
+                    base_title = base_url or "Source"
+
+            # relevance：final_score → rag_similarity → rerank_score，并截到[0,1]
+            rel = 0.0
+            try:
+                if r.get("final_score") is not None:
+                    rel = float(r.get("final_score") or 0.0)
+                elif r.get("rag_similarity") is not None:
+                    rel = float(r.get("rag_similarity") or 0.0)
+                elif r.get("rerank_score") is not None:
+                    rel = float(r.get("rerank_score") or 0.0)
+                rel = max(0.0, min(1.0, rel))
+            except Exception:
+                rel = 0.0
+
+            payload = {
+                "type": "citation",
+                "data": {
+                    "document": chunks if chunks else [doc_for_emit],
+                    "metadata": [
+                        {"source": base_url, "title": base_title, "relevance": rel}
+                    ],
+                    "source": {
+                        "name": base_title,
+                        "url": base_url or "",
+                        "type": r.get("source_type", "webpage"),
+                    },
+                },
+            }
+            await __event_emitter__(payload)
+
+            if self.valves.PERSIST_CITATIONS:
+                self.citations_history.append(payload)
+                if len(self.citations_history) > self.valves.PERSIST_CITATIONS_MAX:
+                    self.citations_history = self.citations_history[
+                        -self.valves.PERSIST_CITATIONS_MAX :
+                    ]
+                return
+
+            full_doc = r.get("content") or ""
             doc_for_emit = take_text(full_doc, self.valves.CITATION_DOC_MAX_CHARS)
             chunks = split_text_chunks(doc_for_emit, self.valves.CITATION_CHUNK_SIZE)
             base_title = (r.get("title") or "") or (r.get("url") or "Source")
@@ -2113,12 +3031,16 @@ class Tools:
         # 进度条管理器
         class ProgressManager:
             def __init__(self, total_steps: int):
-                self.total_steps = total_steps
+                self.total_steps = max(1, int(total_steps))
                 self.current_step = 0
 
             async def update_step(self, description: str, __event_emitter__):
-                self.current_step += 1
-                percentage = int((self.current_step / self.total_steps) * 100)
+                # 累计步数钳制，百分比不超过100
+                if self.current_step < self.total_steps:
+                    self.current_step += 1
+                percentage = int(self.current_step * 100 / self.total_steps)
+                if percentage > 100:
+                    percentage = 100
                 if __event_emitter__:
                     await __event_emitter__(
                         {
@@ -2135,7 +3057,24 @@ class Tools:
                         }
                     )
 
-        # 修复版摘要提取函数
+            async def complete(
+                self, __event_emitter__, description: str = "🎉 处理完成！"
+            ):
+                if __event_emitter__:
+                    await __event_emitter__(
+                        {
+                            "type": "status",
+                            "data": {
+                                "status": "complete",
+                                "description": description,
+                                "done": True,
+                                "progress": 100,
+                                "action": "web_scrape",
+                            },
+                        }
+                    )
+
+        # 摘要提取函数
         async def extract_summaries_fixed(
             content: str,
             user_request: str,
@@ -2143,7 +3082,7 @@ class Tools:
             page_title: str,
             progress_mgr: ProgressManager,
         ) -> List[Dict]:
-            """修复版摘要提取：解决9个分片只返回1个结果的问题"""
+            """摘要提取：解决9个分片只返回1个结果的问题"""
 
             def cleanup(text: str) -> str:
                 t = re.sub(r"\n{4,}", "\n\n", text)
@@ -2250,7 +3189,7 @@ class Tools:
                 return [w for w, _ in sorted(cnt.items(), key=lambda x: -x[1])[:topk]]
 
             async def _extract_one_chunk(idx: int, c: dict):
-                """单个分片的摘要提取 - 修复版"""
+                """单个分片的摘要提取 -"""
                 # 更清晰的系统提示，强调输出格式
                 sys_prompt = f"""你是专业信息提取专家。基于给定内容片段，围绕用户需求提取{per_chunk}条摘要。
 
@@ -2595,8 +3534,15 @@ class Tools:
                     print(f"[DEBUG TRACEBACK] {traceback.format_exc()}")
 
         # 初始化进度管理器
-        total_steps = 6  # 读取网页、摘要提取、RAG、重排序、评分、完成
-        progress_mgr = ProgressManager(total_steps)
+        steps = 2  # 开始处理 + 成功读取
+        if self.valves.ENABLE_SMART_SUMMARY:
+            steps += 2  # 分片处理 + 摘要完成
+        if self.valves.ENABLE_RAG_ENHANCEMENT:
+            steps += 1  # RAG
+        if self.valves.ENABLE_SEMANTIC_RERANK:
+            steps += 1  # 重排
+        steps += 1  # 评分/筛选
+        progress_mgr = ProgressManager(steps)
 
         try:
             debug_log(f"开始智能网页读取，URL数量: {len(urls)}")
@@ -2890,7 +3836,7 @@ class Tools:
                 for idx, summary in enumerate(final_summaries):
                     await emit_citation_data(summary, __event_emitter__, run_id, idx)
 
-                await progress_mgr.update_step("🎉 处理完成！", __event_emitter__)
+                await progress_mgr.complete(__event_emitter__)
 
                 # 构建返回体 - 简化stats信息
                 results_data = []
@@ -2907,7 +3853,6 @@ class Tools:
                         ),  # 使用完整摘要作为snippet
                     }
                     results_data.append(item)
-
                 return json.dumps(
                     {
                         "summaries_count": len(final_summaries),
@@ -2930,7 +3875,6 @@ class Tools:
                         "snippet": take_text(r.get("content", ""), 600),
                     }
                     results_data.append(result_item)
-
                 return json.dumps(
                     {
                         "results_count": len(successful_results),
@@ -2993,6 +3937,223 @@ class Tools:
 
         async def emit_citation_data(r: Dict, __event_emitter__, run_id: str, idx: int):
             if not (__event_emitter__ and self.valves.CITATION_LINKS):
+                return
+
+            full_doc = r.get("content") or ""
+            doc_for = take_text(full_doc, self.valves.CITATION_DOC_MAX_CHARS)
+            chunks = split_text_chunks(doc_for, self.valves.CITATION_CHUNK_SIZE)
+            base_url = (r.get("url") or "").strip()
+            base_title = r.get("title") or ""
+            # 清理“来源 |/：”类前缀
+            try:
+                import re as _re
+
+                base_title = _re.sub(
+                    r"^\s*来源\s*[\|：:]+\s*", "", base_title or ""
+                ).strip()
+            except Exception:
+                pass
+
+            # 分组名：默认用 host（Kimi 会单独改为 host+path）
+            try:
+                from urllib.parse import urlparse
+
+                _p = urlparse(base_url or "")
+                _host = (_p.netloc or "").lower()
+            except Exception:
+                _host = ""
+            src_name = _host or (base_title or "Source")
+
+            # 相关度：final_score → rag_similarity → rerank_score
+            rel = 0.0
+            try:
+                if r.get("final_score") is not None:
+                    rel = float(r.get("final_score") or 0.0)
+                elif r.get("rag_similarity") is not None:
+                    rel = float(r.get("rag_similarity") or 0.0)
+                elif r.get("rerank_score") is not None:
+                    rel = float(r.get("rerank_score") or 0.0)
+                rel = max(0.0, min(1.0, rel))
+            except Exception:
+                rel = 0.0
+
+            tool_tag = (run_id or "").split("-", 1)[0]
+            TOOL_MAP = {
+                "zh-web": "search_chinese_web",
+                "en-web": "search_english_web",
+                "web-scrape": "web_scrape",
+                "web-scrape-raw": "web_scrape_raw",
+                "ai-search": "search_ai_intelligent",
+                "kimi": "kimi_ai_search",
+            }
+            tool_name = TOOL_MAP.get(tool_tag, tool_tag)
+
+            payload = {
+                "type": "citation",
+                "data": {
+                    "document": chunks if chunks else [doc_for],
+                    "metadata": [
+                        {
+                            "source": base_url,
+                            "title": base_title or (_host or "Source"),
+                            "relevance": rel,
+                            "tool": tool_name,
+                            "run_id": run_id,
+                        }
+                    ],
+                    "source": {
+                        "name": src_name,  # ← 仅 host（Kimi 会在其函数里覆盖为 host+path）
+                        "url": base_url or "",
+                        "type": r.get("source_type", "webpage"),
+                    },
+                },
+            }
+            await __event_emitter__(payload)
+
+            if self.valves.PERSIST_CITATIONS:
+                self.citations_history.append(payload)
+                if len(self.citations_history) > self.valves.PERSIST_CITATIONS_MAX:
+                    self.citations_history = self.citations_history[
+                        -self.valves.PERSIST_CITATIONS_MAX :
+                    ]
+                return
+
+            full_doc = r.get("content") or ""
+            doc_for_emit = take_text(full_doc, self.valves.CITATION_DOC_MAX_CHARS)
+            chunks = split_text_chunks(doc_for_emit, self.valves.CITATION_CHUNK_SIZE)
+
+            base_url = (r.get("url") or "").strip()
+            base_title = r.get("title") or ""
+            # 标题兜底：若没有标题，用 host + 末段路径
+            if not base_title:
+                try:
+                    from urllib.parse import urlparse
+
+                    p = urlparse(base_url or "")
+                    host = (p.netloc or "").lower()
+                    tail = (p.path or "/").rstrip("/").split("/")[-1] or "/"
+                    base_title = f"{host} · {tail}" if host else (base_url or "Source")
+                except Exception:
+                    base_title = base_url or "Source"
+
+            # 统一分组：用 host 或兜底标题
+            try:
+                from urllib.parse import urlparse
+
+                p = urlparse(base_url or "")
+                host = (p.netloc or "").lower()
+            except Exception:
+                host = ""
+            src_name = host or (base_title or "Source")
+
+            # relevance：final_score → rag_similarity → rerank_score（截到[0,1]）
+            rel = 0.0
+            try:
+                if r.get("final_score") is not None:
+                    rel = float(r.get("final_score") or 0.0)
+                elif r.get("rag_similarity") is not None:
+                    rel = float(r.get("rag_similarity") or 0.0)
+                elif r.get("rerank_score") is not None:
+                    rel = float(r.get("rerank_score") or 0.0)
+                rel = max(0.0, min(1.0, rel))
+            except Exception:
+                rel = 0.0
+
+            # 产出工具：从 run_id 推断（如 'zh-web-...', 'en-web-...', 'web-scrape', 'ai-search', 'kimi' 等）
+            tool_tag = (run_id or "").split("-", 1)[0]
+            TOOL_MAP = {
+                "zh-web": "search_chinese_web",
+                "en-web": "search_english_web",
+                "web-scrape": "web_scrape",
+                "web-scrape-raw": "web_scrape_raw",
+                "ai-search": "search_ai_intelligent",
+                "kimi": "kimi_ai_search",
+            }
+            tool_name = TOOL_MAP.get(tool_tag, tool_tag)
+
+            payload = {
+                "type": "citation",
+                "data": {
+                    "document": chunks if chunks else [doc_for_emit],
+                    "metadata": [
+                        {
+                            "source": base_url,
+                            "title": base_title,
+                            "relevance": rel,
+                            "tool": tool_name,
+                            "run_id": run_id,
+                        }
+                    ],
+                    "source": {
+                        "name": src_name,
+                        "url": base_url or "",
+                        "type": r.get("source_type", "webpage"),
+                    },
+                },
+            }
+            await __event_emitter__(payload)
+
+            if self.valves.PERSIST_CITATIONS:
+                self.citations_history.append(payload)
+                if len(self.citations_history) > self.valves.PERSIST_CITATIONS_MAX:
+                    self.citations_history = self.citations_history[
+                        -self.valves.PERSIST_CITATIONS_MAX :
+                    ]
+                return
+
+            full_doc = r.get("content") or ""
+            doc_for_emit = take_text(full_doc, self.valves.CITATION_DOC_MAX_CHARS)
+            chunks = split_text_chunks(doc_for_emit, self.valves.CITATION_CHUNK_SIZE)
+
+            # 标题兜底：无标题则用 host + 最末路径段
+            base_url = (r.get("url") or "").strip()
+            base_title = r.get("title") or ""
+            if not base_title:
+                try:
+                    from urllib.parse import urlparse
+
+                    p = urlparse(base_url or "")
+                    host = (p.netloc or "").lower()
+                    tail = (p.path or "/").rstrip("/").split("/")[-1] or "/"
+                    base_title = f"{host} · {tail}" if host else (base_url or "Source")
+                except Exception:
+                    base_title = base_url or "Source"
+
+            # relevance：final_score → rag_similarity → rerank_score，并截到[0,1]
+            rel = 0.0
+            try:
+                if r.get("final_score") is not None:
+                    rel = float(r.get("final_score") or 0.0)
+                elif r.get("rag_similarity") is not None:
+                    rel = float(r.get("rag_similarity") or 0.0)
+                elif r.get("rerank_score") is not None:
+                    rel = float(r.get("rerank_score") or 0.0)
+                rel = max(0.0, min(1.0, rel))
+            except Exception:
+                rel = 0.0
+
+            payload = {
+                "type": "citation",
+                "data": {
+                    "document": chunks if chunks else [doc_for_emit],
+                    "metadata": [
+                        {"source": base_url, "title": base_title, "relevance": rel}
+                    ],
+                    "source": {
+                        "name": base_title,
+                        "url": base_url or "",
+                        "type": r.get("source_type", "webpage"),
+                    },
+                },
+            }
+            await __event_emitter__(payload)
+
+            if self.valves.PERSIST_CITATIONS:
+                self.citations_history.append(payload)
+                if len(self.citations_history) > self.valves.PERSIST_CITATIONS_MAX:
+                    self.citations_history = self.citations_history[
+                        -self.valves.PERSIST_CITATIONS_MAX :
+                    ]
                 return
 
             full_doc = r.get("content") or ""
@@ -3249,6 +4410,223 @@ class Tools:
                 return
 
             full_doc = r.get("content") or ""
+            doc_for = take_text(full_doc, self.valves.CITATION_DOC_MAX_CHARS)
+            chunks = split_text_chunks(doc_for, self.valves.CITATION_CHUNK_SIZE)
+            base_url = (r.get("url") or "").strip()
+            base_title = r.get("title") or ""
+            # 清理“来源 |/：”类前缀
+            try:
+                import re as _re
+
+                base_title = _re.sub(
+                    r"^\s*来源\s*[\|：:]+\s*", "", base_title or ""
+                ).strip()
+            except Exception:
+                pass
+
+            # 分组名：默认用 host（Kimi 会单独改为 host+path）
+            try:
+                from urllib.parse import urlparse
+
+                _p = urlparse(base_url or "")
+                _host = (_p.netloc or "").lower()
+            except Exception:
+                _host = ""
+            src_name = _host or (base_title or "Source")
+
+            # 相关度：final_score → rag_similarity → rerank_score
+            rel = 0.0
+            try:
+                if r.get("final_score") is not None:
+                    rel = float(r.get("final_score") or 0.0)
+                elif r.get("rag_similarity") is not None:
+                    rel = float(r.get("rag_similarity") or 0.0)
+                elif r.get("rerank_score") is not None:
+                    rel = float(r.get("rerank_score") or 0.0)
+                rel = max(0.0, min(1.0, rel))
+            except Exception:
+                rel = 0.0
+
+            tool_tag = (run_id or "").split("-", 1)[0]
+            TOOL_MAP = {
+                "zh-web": "search_chinese_web",
+                "en-web": "search_english_web",
+                "web-scrape": "web_scrape",
+                "web-scrape-raw": "web_scrape_raw",
+                "ai-search": "search_ai_intelligent",
+                "kimi": "kimi_ai_search",
+            }
+            tool_name = TOOL_MAP.get(tool_tag, tool_tag)
+
+            payload = {
+                "type": "citation",
+                "data": {
+                    "document": chunks if chunks else [doc_for],
+                    "metadata": [
+                        {
+                            "source": base_url,
+                            "title": base_title or (_host or "Source"),
+                            "relevance": rel,
+                            "tool": tool_name,
+                            "run_id": run_id,
+                        }
+                    ],
+                    "source": {
+                        "name": src_name,  # ← 仅 host（Kimi 会在其函数里覆盖为 host+path）
+                        "url": base_url or "",
+                        "type": r.get("source_type", "webpage"),
+                    },
+                },
+            }
+            await __event_emitter__(payload)
+
+            if self.valves.PERSIST_CITATIONS:
+                self.citations_history.append(payload)
+                if len(self.citations_history) > self.valves.PERSIST_CITATIONS_MAX:
+                    self.citations_history = self.citations_history[
+                        -self.valves.PERSIST_CITATIONS_MAX :
+                    ]
+                return
+
+            full_doc = r.get("content") or ""
+            doc_for_emit = take_text(full_doc, self.valves.CITATION_DOC_MAX_CHARS)
+            chunks = split_text_chunks(doc_for_emit, self.valves.CITATION_CHUNK_SIZE)
+
+            base_url = (r.get("url") or "").strip()
+            base_title = r.get("title") or ""
+            # 标题兜底：若没有标题，用 host + 末段路径
+            if not base_title:
+                try:
+                    from urllib.parse import urlparse
+
+                    p = urlparse(base_url or "")
+                    host = (p.netloc or "").lower()
+                    tail = (p.path or "/").rstrip("/").split("/")[-1] or "/"
+                    base_title = f"{host} · {tail}" if host else (base_url or "Source")
+                except Exception:
+                    base_title = base_url or "Source"
+
+            # 统一分组：用 host 或兜底标题
+            try:
+                from urllib.parse import urlparse
+
+                p = urlparse(base_url or "")
+                host = (p.netloc or "").lower()
+            except Exception:
+                host = ""
+            src_name = host or (base_title or "Source")
+
+            # relevance：final_score → rag_similarity → rerank_score（截到[0,1]）
+            rel = 0.0
+            try:
+                if r.get("final_score") is not None:
+                    rel = float(r.get("final_score") or 0.0)
+                elif r.get("rag_similarity") is not None:
+                    rel = float(r.get("rag_similarity") or 0.0)
+                elif r.get("rerank_score") is not None:
+                    rel = float(r.get("rerank_score") or 0.0)
+                rel = max(0.0, min(1.0, rel))
+            except Exception:
+                rel = 0.0
+
+            # 产出工具：从 run_id 推断（如 'zh-web-...', 'en-web-...', 'web-scrape', 'ai-search', 'kimi' 等）
+            tool_tag = (run_id or "").split("-", 1)[0]
+            TOOL_MAP = {
+                "zh-web": "search_chinese_web",
+                "en-web": "search_english_web",
+                "web-scrape": "web_scrape",
+                "web-scrape-raw": "web_scrape_raw",
+                "ai-search": "search_ai_intelligent",
+                "kimi": "kimi_ai_search",
+            }
+            tool_name = TOOL_MAP.get(tool_tag, tool_tag)
+
+            payload = {
+                "type": "citation",
+                "data": {
+                    "document": chunks if chunks else [doc_for_emit],
+                    "metadata": [
+                        {
+                            "source": base_url,
+                            "title": base_title,
+                            "relevance": rel,
+                            "tool": tool_name,
+                            "run_id": run_id,
+                        }
+                    ],
+                    "source": {
+                        "name": src_name,
+                        "url": base_url or "",
+                        "type": r.get("source_type", "webpage"),
+                    },
+                },
+            }
+            await __event_emitter__(payload)
+
+            if self.valves.PERSIST_CITATIONS:
+                self.citations_history.append(payload)
+                if len(self.citations_history) > self.valves.PERSIST_CITATIONS_MAX:
+                    self.citations_history = self.citations_history[
+                        -self.valves.PERSIST_CITATIONS_MAX :
+                    ]
+                return
+
+            full_doc = r.get("content") or ""
+            doc_for_emit = take_text(full_doc, self.valves.CITATION_DOC_MAX_CHARS)
+            chunks = split_text_chunks(doc_for_emit, self.valves.CITATION_CHUNK_SIZE)
+
+            # 标题兜底：无标题则用 host + 最末路径段
+            base_url = (r.get("url") or "").strip()
+            base_title = r.get("title") or ""
+            if not base_title:
+                try:
+                    from urllib.parse import urlparse
+
+                    p = urlparse(base_url or "")
+                    host = (p.netloc or "").lower()
+                    tail = (p.path or "/").rstrip("/").split("/")[-1] or "/"
+                    base_title = f"{host} · {tail}" if host else (base_url or "Source")
+                except Exception:
+                    base_title = base_url or "Source"
+
+            # relevance：final_score → rag_similarity → rerank_score，并截到[0,1]
+            rel = 0.0
+            try:
+                if r.get("final_score") is not None:
+                    rel = float(r.get("final_score") or 0.0)
+                elif r.get("rag_similarity") is not None:
+                    rel = float(r.get("rag_similarity") or 0.0)
+                elif r.get("rerank_score") is not None:
+                    rel = float(r.get("rerank_score") or 0.0)
+                rel = max(0.0, min(1.0, rel))
+            except Exception:
+                rel = 0.0
+
+            payload = {
+                "type": "citation",
+                "data": {
+                    "document": chunks if chunks else [doc_for_emit],
+                    "metadata": [
+                        {"source": base_url, "title": base_title, "relevance": rel}
+                    ],
+                    "source": {
+                        "name": base_title,
+                        "url": base_url or "",
+                        "type": r.get("source_type", "webpage"),
+                    },
+                },
+            }
+            await __event_emitter__(payload)
+
+            if self.valves.PERSIST_CITATIONS:
+                self.citations_history.append(payload)
+                if len(self.citations_history) > self.valves.PERSIST_CITATIONS_MAX:
+                    self.citations_history = self.citations_history[
+                        -self.valves.PERSIST_CITATIONS_MAX :
+                    ]
+                return
+
+            full_doc = r.get("content") or ""
             doc_for_emit = take_text(full_doc, self.valves.CITATION_DOC_MAX_CHARS)
             chunks = split_text_chunks(doc_for_emit, self.valves.CITATION_CHUNK_SIZE)
             base_title = (r.get("title") or "") or (r.get("url") or "Source")
@@ -3466,7 +4844,7 @@ class Function:
     def __init__(self):
         self.tools = Tools()
 
-    # Kimi AI基础搜索（修复版：强制联网）
+    # Kimi AI基础搜索
     async def kimi_ai_search(
         self,
         search_query: str,
@@ -3494,14 +4872,14 @@ class Function:
         """🌐 专业英文网页搜索工具"""
         return await self.tools.search_english_web(query, __event_emitter__)
 
-    # 智能网页读取（修复版）
+    # 智能网页读取
     async def web_scrape(
         self,
         urls: List[str],
         user_request: str,
         __event_emitter__: Optional[Callable[[dict], Any]] = None,
     ) -> str:
-        """🌐 智能网页读取工具（修复版）"""
+        """🌐 智能网页读取工具"""
         return await self.tools.web_scrape(urls, user_request, __event_emitter__)
 
     # Raw网页读取（不做处理）
